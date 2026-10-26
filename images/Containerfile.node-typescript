@@ -1,0 +1,7 @@
+ARG BASE_IMAGE=localhost/omnigent-host:opencode-podman-mount1
+FROM ${BASE_IMAGE}
+
+# The matching Omnigent host image provides Node 22/npm; add project tooling.
+RUN npm install --global --no-audit --no-fund \
+      'typescript@7.0.2' 'tsx@4.23.15' 'pnpm@12.15.0' \
+    && node --version && tsc --version && tsx --version && pnpm --version

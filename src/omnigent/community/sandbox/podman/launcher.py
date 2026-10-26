@@ -13,7 +13,9 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import sys
 import time
+from contextlib import closing
 
 import click
 import keyring
@@ -28,6 +30,26 @@ from .config import PodmanConfig
 
 
 _MANAGED_LABEL = "io.omnigent.podman-provider"
+_PROFILE_LABEL = "io.omnigent.podman-profile"
+
+
+def _keyring_label_password(label: str) -> str:
+    """Read one GNOME Login item by its visible label, never by a fuzzy match."""
+    if sys.platform != "linux":
+        raise ValueError("item-label lookup requires Linux Secret Service")
+    import secretstorage
+
+    with closing(secretstorage.dbus_init()) as bus:
+        collection = secretstorage.get_default_collection(bus)
+        if collection.is_locked():
+            raise ValueError("Login collection is locked")
+        matches = [item for item in collection.get_all_items() if item.get_label() == label]
+        if len(matches) != 1:
+            raise ValueError("item label must match exactly one Login item")
+        item = matches[0]
+        if item.is_locked():
+            raise ValueError("keyring item is locked")
+        return item.get_secret().decode("utf-8")
 
 
 class PodmanSandboxLauncher(ExecModelHostLauncher):
@@ -37,6 +59,7 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
 
     def __init__(self, *, config: PodmanConfig):
         self.config = config
+        self.provider = config.provider_id
         self._key_values: dict[str, str] | None = None
 
     def _keys(self) -> dict[str, str]:
@@ -46,14 +69,20 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         values: dict[str, str] = {}
         for key in self.config.keys:
             try:
-                value = keyring.get_password(key.service, key.key_name)
+                if key.item_label is None:
+                    assert key.key_name is not None  # validated by KeyringKey
+                value = (
+                    _keyring_label_password(key.item_label)
+                    if key.item_label is not None
+                    else keyring.get_password(key.service, key.key_name)
+                )
             except Exception:
                 raise click.ClickException(
-                    f"Cannot read keyring entry {key.service}/{key.key_name}"
+                    f"Cannot read keyring entry for {key.env_var}"
                 ) from None
             if not value or "\x00" in value:
                 raise click.ClickException(
-                    f"Missing or invalid keyring entry {key.service}/{key.key_name}"
+                    f"Missing or invalid keyring entry for {key.env_var}"
                 )
             values[key.env_var] = value
         self._key_values = values
@@ -113,6 +142,7 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         args = [
             "create", "--name", container_name,
             "--label", f"{_MANAGED_LABEL}=true",
+            "--label", f"{_PROFILE_LABEL}={self.provider}",
             "--label", f"io.omnigent.session-name={safe_name}",
             "--network", self.config.network,
         ]
@@ -190,6 +220,8 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             details = json.loads(result.stdout)[0]
             if details["Config"]["Labels"].get(_MANAGED_LABEL) != "true":
                 raise click.ClickException("Refusing to manage a container without our label")
+            if details["Config"]["Labels"].get(_PROFILE_LABEL, "podman") != self.provider:
+                raise click.ClickException("Refusing to manage another Podman profile's container")
             return bool(details["State"]["Running"])
         except (IndexError, KeyError, TypeError, ValueError) as exc:
             raise click.ClickException("Podman returned invalid container metadata") from exc

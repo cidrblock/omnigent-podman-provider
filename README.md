@@ -13,8 +13,9 @@ a running Omnigent service by itself.
 
 ## Current status
 
-- The plugin registers `sandbox.provider: podman` with Omnigent's community
-  provider registry and validates `sandbox.podman` settings.
+- The plugin registers `podman` plus any named `podman_*` / `podman-*` entries
+  found in the server config before startup. Each alias has its own image and
+  validated settings; the ID is recorded on its managed hosts.
 - On Fedora rootless Podman, container create, exec, detached processes, stop,
   resume, and removal have been smoke-tested using disposable containers. A
   container on the `host` network also reached this installation's Omnigent
@@ -23,6 +24,10 @@ a running Omnigent service by itself.
   handing a new container to Omnigent. A managed OpenCode session launched on
   Podman, bound an online runner, and completed both an OpenAI turn and an
   EnMaaS GLM 5.3 turn. The disposable session and container were removed.
+- Fedora trials of `podman_python`, `podman_node`, and `podman_nomount` each
+  launched a managed OpenCode session and completed a turn. Their images
+  contain Python 3.11–3.14, Node/TypeScript tooling, and no host mounts,
+  respectively.
 - Multi-repository cloning and macOS Podman-machine operation have not yet been
   exercised end-to-end.
 
@@ -71,7 +76,7 @@ sandbox:
       - OMNIGENT_GIT_USER_EMAIL
 ```
 
-This example reflects the **active Fedora deployment**. `network: host` lets a Linux container
+This is a **single-provider example**. `network: host` lets a Linux container
 reach a server bound to `127.0.0.1:6767`, but also shares the host network
 namespace. For tighter network separation, use a named Podman network and a
 `sandbox.server_url` reachable from that network, then test the callback before
@@ -134,6 +139,81 @@ On Fedora the tested backend is Secret Service through the user's D-Bus
 session. macOS Keychain support follows Python keyring's platform backend but
 has not been tested here.
 
+On Fedora, entries created in **Passwords and Keys** may have only a visible
+description and no service/username attributes. For those, use an exact label
+lookup instead of `key_name`:
+
+```yaml
+keys:
+  - item_label: "My API key"
+    env_var: APP_API_KEY
+```
+
+The provider searches the default Login collection and requires exactly one
+item with that description. This uses the Linux Secret Service backend;
+service/`key_name` lookup remains the portable option for macOS. Descriptions
+and service identifiers are configuration values, not hard-coded in the
+provider. Neither the item value nor its description is logged by the lookup.
+
+### Several images and mount policies
+
+Omnigent needs a unique registered ID for each selectable image. The plugin
+reads `sandbox.providers` from the path in `OMNIGENT_CONFIG` *during plugin
+discovery* and registers IDs beginning `podman_` or `podman-`:
+
+```yaml
+sandbox:
+  providers:
+    - provider: podman
+      server_url: http://127.0.0.1:6767
+      podman: &base
+        image: localhost/omnigent-host:opencode-podman-mount1
+        network: host
+        mounts:
+          - {source: /home/user/.agents/skills, target: /root/.agents/skills, mode: ro, relabel: z}
+    - provider: podman_python
+      server_url: http://127.0.0.1:6767
+      podman_python:
+        <<: *base
+        image: localhost/omnigent-host:python-multi
+    - provider: podman_node
+      server_url: http://127.0.0.1:6767
+      podman_node:
+        <<: *base
+        image: localhost/omnigent-host:node-typescript
+    - provider: podman_nomount
+      server_url: http://127.0.0.1:6767
+      podman_nomount:
+        <<: *base
+        mounts: []
+```
+
+YAML anchors keep shared settings in one place. Provide all the required
+`env`, `keys`, and `bootstrap_command` settings in `&base` as appropriate to
+your deployment. The first configured provider is the default; clients can
+select the others by ID. Omnigent 0.19.x does not expose a separate friendly
+display name. Keep profile IDs stable for existing sessions, and restart the
+server when adding or removing profiles.
+
+Set `OMNIGENT_CONFIG` to the **same absolute YAML path** before starting
+`omnigent` (not only through a later `--config` argument): CLI imports may
+cache provider registrations before `--config` is processed. The plugin reads
+only profile IDs from that file; images, mounts, and credentials remain in the
+Omnigent YAML. It does not need an external provider-config file.
+
+On Fedora, build the optional images from a matching base image already in
+rootless Podman storage:
+
+```bash
+podman build -t localhost/omnigent-host:python-multi -f images/Containerfile.python-multi .
+podman build -t localhost/omnigent-host:node-typescript -f images/Containerfile.node-typescript .
+```
+
+The Python image adds 3.11, 3.13, and 3.14 alongside the base image's 3.12.
+The Node image adds TypeScript, tsx, and pnpm to its existing Node 22.
+Their builds and runtime checks have been exercised on Fedora; macOS remains
+untested.
+
 ## Development checks
 
 From a checkout with Omnigent 0.19.1 available in Python:
@@ -143,7 +223,7 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
 Installing the wheel registers the provider but does not change Omnigent's
-chosen sandbox by itself. The local server now lists Podman first and keeps
-Microsandbox second for existing VM sessions and rollback. Host-specific
+chosen sandbox by itself. The local server lists Podman first, the three
+named profiles next, and Microsandbox for existing VM sessions and rollback. Host-specific
 deployment notes and test results are in `~/docs/omnigent/podman.md` on this
 workstation.

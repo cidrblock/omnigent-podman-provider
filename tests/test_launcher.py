@@ -1,7 +1,9 @@
 """Contract tests for the managed Podman lifecycle and secret-safe exec path."""
 
 import os
+import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,7 +21,9 @@ sandbox_namespace.__path__.insert(
 )
 
 from omnigent.community.sandbox.podman.config import PodmanConfig
+from omnigent.community.sandbox.podman.config import profile_config_model
 from omnigent.community.sandbox.podman.launcher import PodmanSandboxLauncher
+from omnigent.community.sandbox.podman.launcher import _keyring_label_password
 from omnigent.community.sandbox.podman.plugin import get_contribution
 
 
@@ -41,6 +45,62 @@ class PodmanLauncherTests(unittest.TestCase):
         self.assertTrue(self.launcher.capabilities.resume_stopped)
         self.assertTrue(self.launcher.capabilities.git_clone_options)
 
+    def test_configured_aliases_have_independent_launcher_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text("""sandbox:
+  providers:
+    - provider: podman-python
+      podman-python: {image: localhost/python:latest}
+    - provider: podman-node
+      podman-node: {image: localhost/node:latest}
+    - provider: microsandbox
+""")
+            with patch.dict(os.environ, {"OMNIGENT_CONFIG": str(config_path)}):
+                providers = get_contribution().providers
+            self.assertEqual(set(providers), {"podman", "podman-python", "podman-node"})
+            for alias in ("podman-python", "podman-node"):
+                metadata = providers[alias]
+                self.assertEqual(metadata.config_model.__module__, "omnigent.community.sandbox.podman.config")
+                config = metadata.config_model(image="example")
+                self.assertEqual(PodmanSandboxLauncher(config=config).provider, alias)
+                with self.assertRaises(ValidationError):
+                    metadata.config_model(image="example", provider_id="podman")
+
+    def test_profile_registration_rejects_duplicate_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text("sandbox:\n  providers:\n    - provider: podman-python\n    - provider: podman-python\n")
+            with patch.dict(os.environ, {"OMNIGENT_CONFIG": str(config_path)}):
+                with self.assertRaisesRegex(ValueError, "duplicate Podman profile"):
+                    get_contribution()
+
+    def test_aliases_resolve_through_omnigent_deployment_parser(self):
+        import yaml
+        from omnigent.onboarding.sandboxes import registry
+        from omnigent.server.managed_hosts import parse_sandbox_config
+
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.yaml"
+            config_path.write_text("""sandbox:
+  providers:
+    - provider: podman-python
+      server_url: http://127.0.0.1:6767
+      podman-python: {image: localhost/python:test}
+    - provider: podman-node
+      server_url: http://127.0.0.1:6767
+      podman-node: {image: localhost/node:test}
+""")
+            with patch.dict(os.environ, {"OMNIGENT_CONFIG": str(config_path)}):
+                registry.reset_plugin_state_for_tests()
+                try:
+                    deployment = parse_sandbox_config(yaml.safe_load(config_path.read_text())["sandbox"])
+                    self.assertEqual(deployment.launchable_providers(), ("podman-python", "podman-node"))
+                    for alias in deployment.launchable_providers():
+                        self.assertEqual(deployment.for_provider(alias).launcher_factory().provider, alias)
+                finally:
+                    registry.reset_plugin_state_for_tests()
+
     def test_config_rejects_values_disguised_as_env_names(self):
         with self.assertRaises(ValidationError):
             PodmanConfig(image="test", env=["GH_TOKEN=secret"])
@@ -49,6 +109,8 @@ class PodmanLauncherTests(unittest.TestCase):
 
     def test_keyring_config_rejects_duplicate_or_persisted_env_names(self):
         key = {"key_name": "enmaas", "env_var": "ENMAAS_KEY"}
+        with self.assertRaises(ValidationError):
+            PodmanConfig(image="test", keys=[{"env_var": "SAMPLE_KEY"}])
         with self.assertRaises(ValidationError):
             PodmanConfig(image="test", keys=[{**key, "env_var": "BAD=VALUE"}])
         with self.assertRaises(ValidationError):
@@ -153,6 +215,30 @@ class PodmanLauncherTests(unittest.TestCase):
             launcher.provision("session")
         self.assertNotIn("private backend detail", str(failure.exception))
 
+    @patch("omnigent.community.sandbox.podman.launcher._keyring_label_password", return_value="label-secret")
+    @patch("omnigent.community.sandbox.podman.launcher.keyring.get_password")
+    def test_visible_label_uses_secret_service_instead_of_service_attributes(self, get_password, lookup):
+        launcher = PodmanSandboxLauncher(config=PodmanConfig(
+            image="test", keys=[{"env_var": "SAMPLE_KEY", "item_label": "Sample secret"}]
+        ))
+        self.assertEqual(launcher._keys()["SAMPLE_KEY"], "label-secret")
+        lookup.assert_called_once_with("Sample secret")
+        get_password.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "linux", "Secret Service labels are Linux-only")
+    @patch("secretstorage.get_default_collection")
+    @patch("secretstorage.dbus_init")
+    def test_visible_label_rejects_multiple_matches(self, dbus, get_collection):
+        from unittest.mock import Mock
+
+        dbus.return_value.close = Mock()
+        item = Mock()
+        item.get_label.return_value = "duplicate"
+        get_collection.return_value.is_locked.return_value = False
+        get_collection.return_value.get_all_items.return_value = [item, item]
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            _keyring_label_password("duplicate")
+
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
     @patch("omnigent.community.sandbox.podman.launcher.os.environ", {"GH_TOKEN": "sample-secret"})
     def test_provision_forwards_only_env_names_and_starts(self, run):
@@ -168,6 +254,22 @@ class PodmanLauncherTests(unittest.TestCase):
         self.assertNotIn("--entrypoint", create)
         self.assertEqual(run.call_args_list[1].args[0], ["podman", "start", "container-id"])
         self.assertEqual(run.call_args_list[2].args[0][1:3], ["exec", "container-id"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_alias_container_records_identity_and_rejects_cross_profile_cleanup(self, run):
+        config = profile_config_model("podman-python")(image="example")
+        launcher = PodmanSandboxLauncher(config=config)
+        run.side_effect = [completed([], stdout="container-id"), completed([]), completed([])]
+        launcher.provision("session")
+        create = run.call_args_list[0].args[0]
+        self.assertIn("io.omnigent.podman-profile=podman-python", create)
+        run.reset_mock(side_effect=True)
+        run.return_value = completed([], stdout=json.dumps([{"Config": {"Labels": {
+            "io.omnigent.podman-provider": "true", "io.omnigent.podman-profile": "podman-node"
+        }}, "State": {"Running": True}}]))
+        with self.assertRaisesRegex(click.ClickException, "another Podman profile"):
+            launcher.terminate("container-id")
+        self.assertEqual(run.call_count, 1)
 
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
     @patch("omnigent.community.sandbox.podman.launcher.keyring.get_password", return_value="host-secret")

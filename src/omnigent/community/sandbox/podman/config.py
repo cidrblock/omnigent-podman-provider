@@ -4,7 +4,7 @@ import re
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator, model_validator
 
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -41,9 +41,10 @@ class KeyringKey(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    key_name: str = Field(min_length=1)
+    key_name: str | None = Field(default=None, min_length=1)
     env_var: str
     service: str = Field(default="omnigent-podman-provider", min_length=1)
+    item_label: str | None = Field(default=None, min_length=1)
 
     @field_validator("env_var")
     @classmethod
@@ -52,6 +53,12 @@ class KeyringKey(BaseModel):
             raise ValueError("env_var must be an environment variable name")
         return name
 
+    @model_validator(mode="after")
+    def validate_lookup(self) -> "KeyringKey":
+        if self.key_name is None and self.item_label is None:
+            raise ValueError("key_name or item_label is required")
+        return self
+
 
 class PodmanConfig(BaseModel):
     """Image, networking, and explicitly forwarded host environment names."""
@@ -59,6 +66,7 @@ class PodmanConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     image: str = Field(min_length=1)
+    provider_id: Literal["podman"] = Field(default="podman", exclude=True)
     network: str = Field(default="host", min_length=1)
     env: list[str] = Field(default_factory=list)
     binary: str = Field(default="podman", min_length=1)
@@ -99,3 +107,13 @@ class PodmanConfig(BaseModel):
         if set(names) & set(self.env):
             raise ValueError("keyring env_var names cannot also appear in env")
         return self
+
+
+def profile_config_model(provider_id: str) -> type[PodmanConfig]:
+    """Bind the registered identity into an alias's validated config model."""
+    return create_model(
+        f"PodmanConfig_{provider_id.replace('-', '_')}",
+        __base__=PodmanConfig,
+        __module__=__name__,
+        provider_id=(Literal[provider_id], Field(default=provider_id, exclude=True)),
+    )

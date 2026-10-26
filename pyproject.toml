@@ -4,12 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omnigent-podman-provider"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fedora-first rootless Podman sandbox provider for Omnigent"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = ["omnigent>=0.19.1,<0.20", "pydantic>=2", "keyring>=25,<27"]
+dependencies = [
+  "omnigent>=0.19.1,<0.20",
+  "pydantic>=2",
+  "PyYAML>=6",
+  "keyring>=25,<27",
+  "secretstorage>=3.2; sys_platform == 'linux'",
+]
 
 [project.entry-points."omnigent.sandbox_providers"]
 podman = "omnigent.community.sandbox.podman.plugin:get_contribution"

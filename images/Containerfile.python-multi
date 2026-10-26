@@ -1,0 +1,13 @@
+ARG BASE_IMAGE=localhost/omnigent-host:opencode-podman-mount1
+FROM ${BASE_IMAGE}
+
+# Keep the Omnigent runtime on its existing Python; these are additional
+# interpreters for project virtual environments.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN /opt/venv/bin/python -m pip install --no-cache-dir 'uv==0.12.3' \
+    && /opt/venv/bin/uv python install 3.11 3.13 3.14 \
+    && for version in 3.11 3.13 3.14; do \
+         ln -s "$(/opt/venv/bin/uv python find "$version")" "/usr/local/bin/python${version}"; \
+       done \
+    && python3.11 --version && python3.12 --version \
+    && python3.13 --version && python3.14 --version
