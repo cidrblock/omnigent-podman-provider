@@ -1,5 +1,6 @@
 """Contract tests for the managed Podman lifecycle and secret-safe exec path."""
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -45,6 +46,15 @@ class PodmanLauncherTests(unittest.TestCase):
             PodmanConfig(image="test", env=["GH_TOKEN=secret"])
         with self.assertRaises(ValidationError):
             PodmanConfig(image="test", env=["GH_TOKEN", "GH_TOKEN"])
+
+    def test_keyring_config_rejects_duplicate_or_persisted_env_names(self):
+        key = {"key_name": "enmaas", "env_var": "ENMAAS_KEY"}
+        with self.assertRaises(ValidationError):
+            PodmanConfig(image="test", keys=[{**key, "env_var": "BAD=VALUE"}])
+        with self.assertRaises(ValidationError):
+            PodmanConfig(image="test", keys=[key, key])
+        with self.assertRaises(ValidationError):
+            PodmanConfig(image="test", env=["ENMAAS_KEY"], keys=[key])
 
     def test_mounts_require_absolute_nonoverlapping_paths(self):
         for source, target in (("relative", "/root/scratch"), ("/tmp/one", "../scratch"),
@@ -105,6 +115,45 @@ class PodmanLauncherTests(unittest.TestCase):
         self.assertNotIn(token, str(args) + str(failure.exception))
 
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    @patch("omnigent.community.sandbox.podman.launcher.keyring.get_password")
+    def test_keyring_secret_is_shell_quoted_over_stdin_only(self, get_password, run):
+        secret = "a'$(touch /tmp/not-executed)"
+        get_password.return_value = secret
+        run.return_value = completed([], stdout="ok")
+        launcher = PodmanSandboxLauncher(config=PodmanConfig(
+            image="test", keys=[{"service": "work", "key_name": "api", "env_var": "WORK_API_KEY"}]
+        ))
+        with patch.dict("omnigent.community.sandbox.podman.launcher.os.environ", {}, clear=True):
+            self.assertEqual(launcher.run("container-id", 'printf %s "$WORK_API_KEY"').stdout, "ok")
+            self.assertNotIn("WORK_API_KEY", os.environ)
+        get_password.assert_called_once_with("work", "api")
+        args = run.call_args.args[0]
+        script = run.call_args.kwargs["input"]
+        self.assertNotIn(secret, str(args))
+        self.assertNotIn(secret, script)
+        self.assertIn("export WORK_API_KEY=", script)
+        self.assertIn("'\"'\"'", script)
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    @patch("omnigent.community.sandbox.podman.launcher.keyring.get_password", return_value=None)
+    def test_missing_key_fails_before_container_creation(self, _get_password, run):
+        launcher = PodmanSandboxLauncher(config=PodmanConfig(
+            image="test", keys=[{"key_name": "missing", "env_var": "MISSING_KEY"}]
+        ))
+        with self.assertRaisesRegex(click.ClickException, "Missing or invalid keyring entry"):
+            launcher.provision("session")
+        run.assert_not_called()
+
+    @patch("omnigent.community.sandbox.podman.launcher.keyring.get_password", side_effect=RuntimeError("private backend detail"))
+    def test_keyring_backend_errors_do_not_expose_backend_details(self, _get_password):
+        launcher = PodmanSandboxLauncher(config=PodmanConfig(
+            image="test", keys=[{"service": "work", "key_name": "api", "env_var": "WORK_KEY"}]
+        ))
+        with self.assertRaises(click.ClickException) as failure:
+            launcher.provision("session")
+        self.assertNotIn("private backend detail", str(failure.exception))
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
     @patch("omnigent.community.sandbox.podman.launcher.os.environ", {"GH_TOKEN": "sample-secret"})
     def test_provision_forwards_only_env_names_and_starts(self, run):
         run.side_effect = [completed([], stdout="container-id\n"), completed([]), completed([])]
@@ -119,6 +168,24 @@ class PodmanLauncherTests(unittest.TestCase):
         self.assertNotIn("--entrypoint", create)
         self.assertEqual(run.call_args_list[1].args[0], ["podman", "start", "container-id"])
         self.assertEqual(run.call_args_list[2].args[0][1:3], ["exec", "container-id"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    @patch("omnigent.community.sandbox.podman.launcher.keyring.get_password", return_value="host-secret")
+    def test_bootstrap_receives_key_without_storing_it_in_podman_config(self, _get_password, run):
+        launcher = PodmanSandboxLauncher(config=PodmanConfig(
+            image="test", keys=[{"key_name": "enmaas", "env_var": "ENMAAS_KEY"}],
+            bootstrap_command="/usr/local/bin/omnigent-guest-init /bin/true",
+        ))
+        run.side_effect = [completed([], stdout="container-id"), completed([]),
+                           completed([]), completed([])]
+        launcher.provision("session")
+        create = run.call_args_list[0].args[0]
+        self.assertNotIn("ENMAAS_KEY", str(create))
+        self.assertNotIn("host-secret", str(create))
+        bootstrap = run.call_args_list[3]
+        self.assertEqual(bootstrap.args[0][1:3], ["exec", "-i"])
+        self.assertIn("export ENMAAS_KEY=host-secret", bootstrap.kwargs["input"])
+        self.assertIn("omnigent-guest-init /bin/true", bootstrap.kwargs["input"])
 
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
     def test_start_failure_cleans_up(self, run):

@@ -52,9 +52,12 @@ sandbox:
         mode: rw
         relabel: Z
         per_session: true
+    keys:
+      - key_name: enmaas
+        env_var: ENMAAS_KEY
+    bootstrap_command: /usr/local/bin/omnigent-guest-init /bin/true
     env:
       - OPENAI_API_KEY
-      - ENMAAS_KEY
       - GH_TOKEN
       - GIT_TOKEN
       - JIRA_USERNAME
@@ -100,6 +103,36 @@ command line. The values are still accessible inside each container and in
 Podman's container configuration; avoid sharing `podman inspect` output for
 credential-bearing containers. The underlying guest init must understand any
 credential bootstrap variables it receives.
+
+### Keys from the host keyring
+
+`keys` optionally maps a keyring entry to a runtime environment variable.
+Each entry has `key_name`, `env_var`, and an optional `service` (default:
+`omnigent-podman-provider`). For example, store the EnMaaS key through a
+hidden prompt on the host:
+
+```bash
+python -m keyring set omnigent-podman-provider enmaas
+```
+
+The provider reads the entry with `keyring.get_password(service, key_name)`
+and fails a new launch if it is unavailable. It passes an appropriately
+shell-quoted `export` over `podman exec -i` **stdin** for commands run in the
+container. Unlike `env`, the key does not appear in `podman create` arguments
+or Podman's stored container environment. The key is still available in the
+environment of the launched process and any children it starts. `keys`
+rejects duplicate `env_var` names and names also listed under `env`.
+
+If an image must store the secret in its private credential files before
+Omnigent starts, configure `bootstrap_command` as shown above. It runs once
+after the image's normal entrypoint has finished, with the key available only
+to that command's process. The example re-runs this host image's guest init to
+write its mode-0600 OpenCode auth file. This is an image-specific command; do
+not use it with an image that lacks that script. Replacing a keyring entry
+affects new launches; already-running hosts keep their existing credentials.
+On Fedora the tested backend is Secret Service through the user's D-Bus
+session. macOS Keychain support follows Python keyring's platform backend but
+has not been tested here.
 
 ## Development checks
 

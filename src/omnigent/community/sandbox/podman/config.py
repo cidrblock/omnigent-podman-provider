@@ -36,6 +36,23 @@ class BindMount(BaseModel):
         return self
 
 
+class KeyringKey(BaseModel):
+    """Map a host keyring credential to a container process variable."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key_name: str = Field(min_length=1)
+    env_var: str
+    service: str = Field(default="omnigent-podman-provider", min_length=1)
+
+    @field_validator("env_var")
+    @classmethod
+    def validate_env_var(cls, name: str) -> str:
+        if not _ENV_NAME.fullmatch(name):
+            raise ValueError("env_var must be an environment variable name")
+        return name
+
+
 class PodmanConfig(BaseModel):
     """Image, networking, and explicitly forwarded host environment names."""
 
@@ -49,6 +66,8 @@ class PodmanConfig(BaseModel):
     require_rootless: bool = True
     startup_timeout_s: int = Field(default=60, ge=1, le=300)
     mounts: list[BindMount] = Field(default_factory=list)
+    keys: list[KeyringKey] = Field(default_factory=list)
+    bootstrap_command: str | None = Field(default=None, min_length=1)
 
     @field_validator("env")
     @classmethod
@@ -70,3 +89,13 @@ class PodmanConfig(BaseModel):
         ):
             raise ValueError("mount targets must be distinct and non-overlapping")
         return mounts
+
+    @model_validator(mode="after")
+    def validate_keys(self) -> "PodmanConfig":
+        """Prevent a keyring value from also entering Podman's stored env."""
+        names = [key.env_var for key in self.keys]
+        if len(names) != len(set(names)):
+            raise ValueError("keyring env_var names must be unique")
+        if set(names) & set(self.env):
+            raise ValueError("keyring env_var names cannot also appear in env")
+        return self

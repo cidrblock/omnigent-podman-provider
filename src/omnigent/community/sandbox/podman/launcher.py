@@ -10,11 +10,13 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import time
 
 import click
+import keyring
 from omnigent.onboarding.sandboxes.base import (
     ExecModelHostLauncher,
     RemoteCommandResult,
@@ -35,6 +37,27 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
 
     def __init__(self, *, config: PodmanConfig):
         self.config = config
+        self._key_values: dict[str, str] | None = None
+
+    def _keys(self) -> dict[str, str]:
+        """Read each requested credential without exporting it on the host."""
+        if self._key_values is not None:
+            return self._key_values
+        values: dict[str, str] = {}
+        for key in self.config.keys:
+            try:
+                value = keyring.get_password(key.service, key.key_name)
+            except Exception:
+                raise click.ClickException(
+                    f"Cannot read keyring entry {key.service}/{key.key_name}"
+                ) from None
+            if not value or "\x00" in value:
+                raise click.ClickException(
+                    f"Missing or invalid keyring entry {key.service}/{key.key_name}"
+                )
+            values[key.env_var] = value
+        self._key_values = values
+        return values
 
     @property
     def capabilities(self) -> SandboxCapabilities:
@@ -80,9 +103,11 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         for mount in self.config.mounts:
             if not mount.source.is_dir() or mount.source.is_symlink():
                 raise click.ClickException(f"Podman mount source must be an existing directory: {mount.source}")
+        self._keys()
 
     def provision(self, name: str) -> str:
         """Create a stopped container and boot its long-lived placeholder PID 1."""
+        self._keys()
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-.")[:48] or "session"
         container_name = f"omni-{safe_name}-{secrets.token_hex(4)}"
         args = [
@@ -123,6 +148,8 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
                     'test "$(cat /proc/1/comm)" = sleep', timeout=10,
                 )
                 if ready.returncode == 0:
+                    if self.config.bootstrap_command:
+                        self.run(container_id, self.config.bootstrap_command)
                     return container_id
                 time.sleep(0.5)
         except BaseException:
@@ -135,9 +162,12 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         self, sandbox_id: str, command: str, *, check: bool = True
     ) -> RemoteCommandResult:
         """Execute a shell script over stdin, keeping launch tokens out of argv."""
+        exports = "".join(
+            f"export {name}={shlex.quote(value)}\n" for name, value in self._keys().items()
+        )
         result = self._podman(
             "exec", "-i", sandbox_id, "/bin/sh", "-s",
-            input=command + "\n", timeout=None,
+            input=exports + command + "\n", timeout=None,
         )
         completed = RemoteCommandResult(
             returncode=result.returncode, stdout=result.stdout, stderr=result.stderr
