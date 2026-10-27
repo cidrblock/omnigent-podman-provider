@@ -130,8 +130,12 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             if self._podman("network", "exists", self.config.network).returncode:
                 raise click.ClickException(f"Podman network is unavailable: {self.config.network}")
         for mount in self.config.mounts:
-            if not mount.source.is_dir() or mount.source.is_symlink():
-                raise click.ClickException(f"Podman mount source must be an existing directory: {mount.source}")
+            # A file source mounts one file (Podman creates the target path and
+            # its parents); a directory source is the usual case.
+            if not (mount.source.is_dir() or mount.source.is_file()) or mount.source.is_symlink():
+                raise click.ClickException(
+                    f"Podman mount source must be an existing file or directory: {mount.source}"
+                )
         self._keys()
 
     def provision(self, name: str) -> str:

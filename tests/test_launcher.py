@@ -20,7 +20,7 @@ sandbox_namespace.__path__.insert(
     0, str(Path(__file__).resolve().parents[1] / "src/omnigent/community/sandbox")
 )
 
-from omnigent.community.sandbox.podman.config import PodmanConfig
+from omnigent.community.sandbox.podman.config import BindMount, PodmanConfig
 from omnigent.community.sandbox.podman.config import profile_config_model
 from omnigent.community.sandbox.podman.launcher import PodmanSandboxLauncher
 from omnigent.community.sandbox.podman.launcher import _keyring_label_password
@@ -523,6 +523,30 @@ class PodmanLauncherTests(unittest.TestCase):
         launcher.provision("session")
         create = run.call_args_list[0].args[0]
         self.assertIn("OMNIGENT_CONFIG_HOME=/opt/provider", create)
+
+    def test_mount_source_may_be_a_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host_file = Path(directory) / "AGENTS.md"
+            host_file.write_text("instructions\n")
+            config = PodmanConfig(
+                image="example",
+                network="pasta",
+                mounts=[{"source": str(host_file), "target": "/root/workspace/AGENTS.md", "mode": "ro"}],
+            )
+            launcher = PodmanSandboxLauncher(config=config)
+            with patch(
+                "omnigent.community.sandbox.podman.launcher.subprocess.run"
+            ) as run:
+                run.side_effect = [completed([], stdout="true"), completed([])]
+                launcher.prepare()  # must not reject a file source
+            self.assertTrue(config.mounts[0].source.is_file())
+
+    def test_per_session_mount_must_be_a_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            host_file = Path(directory) / "AGENTS.md"
+            host_file.write_text("x\n")
+            with self.assertRaisesRegex(ValidationError, "must be directories"):
+                BindMount(source=host_file, target="/root/x", mode="rw", per_session=True)
 
     def test_no_fence_or_capability_change_without_deny_cidrs(self):
         launcher = PodmanSandboxLauncher(

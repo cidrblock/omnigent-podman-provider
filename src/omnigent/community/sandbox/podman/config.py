@@ -35,7 +35,12 @@ def is_passthrough_network(network: str) -> bool:
 
 
 class BindMount(BaseModel):
-    """One host directory exposed at an explicit container path."""
+    """One host path (file or directory) exposed at an explicit container path.
+
+    A file source lets an operator drop a single file into the container (e.g. an
+    agent's ``AGENTS.md``) without a bootstrap copy step. Podman creates the
+    target path and its parent directories if they do not exist in the image.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -57,6 +62,8 @@ class BindMount(BaseModel):
             raise ValueError("mount paths cannot contain colon or control characters")
         if self.per_session and self.mode != "rw":
             raise ValueError("per-session mounts must be writable")
+        if self.per_session and self.source.is_file():
+            raise ValueError("per_session mounts must be directories")
         return self
 
 
