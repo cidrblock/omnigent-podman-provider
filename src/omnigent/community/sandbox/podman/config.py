@@ -9,6 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _IPV4_CIDR = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?:/[0-9]{1,2})?\Z")
+#: Capabilities an operator may grant. Deliberately tiny: NET_ADMIN is what an
+#: entrypoint needs to install an egress fence, NET_RAW for diagnostic tooling.
+_ALLOWED_CAP_ADD = frozenset({"NET_ADMIN", "NET_RAW"})
 # Podman forwards everything after ``mode:`` to the mode's own process, so a
 # network value may carry options (``pasta:--map-host-loopback=169.254.170.2``).
 _NETWORK_WITH_OPTIONS = re.compile(r"(?:pasta|slirp4netns):\S+\Z")
@@ -87,6 +90,9 @@ class PodmanConfig(BaseModel):
     provider_id: Literal["podman"] = Field(default="podman", exclude=True)
     network: str = Field(default="host", min_length=1)
     deny_cidrs: list[str] = Field(default_factory=list)
+    cap_add: list[str] = Field(default_factory=list)
+    runtime_user: str | None = Field(default=None, min_length=1)
+    runtime_home: str = Field(default="/root", min_length=2)
     env: list[str] = Field(default_factory=list)
     binary: str = Field(default="podman", min_length=1)
     entrypoint: str | None = None
@@ -126,6 +132,32 @@ class PodmanConfig(BaseModel):
         if set(names) & set(self.env):
             raise ValueError("keyring env_var names cannot also appear in env")
         return self
+
+    @field_validator("runtime_user")
+    @classmethod
+    def validate_runtime_user(cls, name: str | None) -> str | None:
+        """Keep the value safe for argv and for ``podman exec --user``."""
+        if name is not None and not _ENV_NAME.fullmatch(name):
+            raise ValueError("runtime_user must be a plain user name")
+        return name
+
+    @field_validator("runtime_home")
+    @classmethod
+    def validate_runtime_home(cls, path: str) -> str:
+        if not path.startswith("/") or ".." in path.split("/"):
+            raise ValueError("runtime_home must be an absolute path without '..'")
+        return path
+
+    @field_validator("cap_add")
+    @classmethod
+    def validate_cap_add(cls, caps: list[str]) -> list[str]:
+        """Only allow the two capabilities a sandbox fence or probes need."""
+        if len(caps) != len(set(caps)):
+            raise ValueError("cap_add must be unique")
+        unknown = set(caps) - _ALLOWED_CAP_ADD
+        if unknown:
+            raise ValueError(f"cap_add only accepts {sorted(_ALLOWED_CAP_ADD)}")
+        return caps
 
     @field_validator("deny_cidrs")
     @classmethod

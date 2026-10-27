@@ -150,8 +150,10 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         # process that runs nft needs NET_ADMIN. The sandbox therefore keeps
         # that capability for its lifetime: the fence is an accident guardrail
         # for a trusted agent, not a boundary against a hostile one.
-        if self.config.deny_cidrs:
+        if self.config.deny_cidrs and "NET_ADMIN" not in self.config.cap_add:
             args.extend(["--cap-add", "NET_ADMIN"])
+        for capability in self.config.cap_add:
+            args.extend(["--cap-add", capability])
         args.extend(option for key in self.config.env if key in os.environ for option in ("--env", key))
         for mount in self.config.mounts:
             source = mount.source
@@ -185,7 +187,7 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
                 )
                 if ready.returncode == 0:
                     if self.config.deny_cidrs:
-                        self.run(container_id, self._egress_fence_script())
+                        self.run(container_id, self._egress_fence_script(), as_root=True)
                     if self.config.bootstrap_command:
                         self.run(container_id, self.config.bootstrap_command)
                     return container_id
@@ -221,14 +223,32 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         return "\n".join(lines)
 
     def run(
-        self, sandbox_id: str, command: str, *, check: bool = True
+        self, sandbox_id: str, command: str, *, check: bool = True, as_root: bool = False
     ) -> RemoteCommandResult:
-        """Execute a shell script over stdin, keeping launch tokens out of argv."""
+        """Execute a shell script over stdin, keeping launch tokens out of argv.
+
+        When ``runtime_user`` is configured, every command runs as that
+        unprivileged user — including the managed host that Omnigent starts
+        through this method, and therefore the runners, harness, and agent
+        shells below it. Privileged setup that must stay root (installing an
+        egress fence) passes ``as_root=True`` explicitly.
+        """
         exports = "".join(
             f"export {name}={shlex.quote(value)}\n" for name, value in self._keys().items()
         )
+        exec_args = ["exec", "-i"]
+        if self.config.runtime_user is not None:
+            if as_root:
+                exec_args += ["--user", "root"]
+            else:
+                exec_args += [
+                    "--user",
+                    self.config.runtime_user,
+                    "--env",
+                    f"HOME={self.config.runtime_home}",
+                ]
         result = self._podman(
-            "exec", "-i", sandbox_id, "/bin/sh", "-s",
+            *exec_args, sandbox_id, "/bin/sh", "-s",
             input=exports + command + "\n", timeout=None,
         )
         completed = RemoteCommandResult(

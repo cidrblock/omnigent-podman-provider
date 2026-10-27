@@ -416,6 +416,57 @@ class PodmanLauncherTests(unittest.TestCase):
         self.assertIn("nft add rule inet omnigent_egress out ip daddr 192.168.0.0/24 drop", fence_call.kwargs["input"])
         self.assertIn("omnigent-guest-init", bootstrap_call.kwargs["input"])
 
+    def test_cap_add_is_allowlisted(self):
+        for bad in ["SYS_ADMIN", "ALL", "net_admin"]:
+            with self.assertRaisesRegex(ValidationError, "cap_add"):
+                PodmanConfig(image="example", cap_add=[bad])
+        self.assertEqual(PodmanConfig(image="example", cap_add=["NET_ADMIN"]).cap_add, ["NET_ADMIN"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_cap_add_reaches_create(self, run):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(image="example", network="pasta", cap_add=["NET_ADMIN"])
+        )
+        run.side_effect = [
+            completed([], stdout="container-id"), completed([]), completed([], stdout="sleep")
+        ]
+        launcher.provision("session")
+        create = run.call_args_list[0].args[0]
+        self.assertEqual(create[create.index("--cap-add") + 1], "NET_ADMIN")
+        self.assertEqual(create.count("--cap-add"), 1)
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_run_execs_as_runtime_user_unless_root_is_requested(self, run):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(image="example", runtime_user="agent", runtime_home="/root")
+        )
+        run.return_value = completed([], stdout="")
+        launcher.run("container-id", "true")
+        unprivileged = run.call_args_list[0].args[0]
+        self.assertEqual(unprivileged[1:5], ["exec", "-i", "--user", "agent"])
+        self.assertIn("HOME=/root", unprivileged)
+        run.reset_mock()
+        launcher.run("container-id", "true", as_root=True)
+        self.assertEqual(run.call_args_list[0].args[0][1:5], ["exec", "-i", "--user", "root"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_fence_install_stays_root_when_a_runtime_user_is_set(self, run):
+        config = PodmanConfig(
+            image="example",
+            network="pasta:--map-host-loopback=169.254.170.2",
+            deny_cidrs=["192.168.0.0/24"],
+            runtime_user="agent",
+        )
+        launcher = PodmanSandboxLauncher(config=config)
+        run.side_effect = [
+            completed([], stdout="container-id"), completed([]),
+            completed([], stdout="sleep"), completed([]),
+        ]
+        launcher.provision("session")
+        fence = run.call_args_list[3].args[0]
+        self.assertIn("root", fence)
+        self.assertNotIn("agent", fence)
+
     def test_no_fence_or_capability_change_without_deny_cidrs(self):
         launcher = PodmanSandboxLauncher(
             config=PodmanConfig(image="example", network="pasta")
