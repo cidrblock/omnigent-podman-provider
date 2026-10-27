@@ -226,18 +226,26 @@ class PodmanLauncherTests(unittest.TestCase):
         get_password.assert_not_called()
 
     @unittest.skipUnless(sys.platform == "linux", "Secret Service labels are Linux-only")
-    @patch("secretstorage.get_default_collection")
-    @patch("secretstorage.dbus_init")
-    def test_visible_label_rejects_multiple_matches(self, dbus, get_collection):
+    def test_visible_label_rejects_multiple_matches(self):
         from unittest.mock import Mock
+        from omnigent.community.sandbox.podman.launcher import _keyring_description_password
 
-        dbus.return_value.close = Mock()
-        item = Mock()
-        item.get_label.return_value = "duplicate"
-        get_collection.return_value.is_locked.return_value = False
-        get_collection.return_value.get_all_items.return_value = [item, item]
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            _keyring_label_password("duplicate")
+        items = []
+        for _ in range(2):
+            item = Mock()
+            item.get_label.return_value = "duplicate"
+            items.append(item)
+        collection = Mock()
+        collection.get_label.return_value = "Agents"
+        collection.is_locked.return_value = False
+        collection.get_all_items.return_value = items
+        secretstorage = Mock()
+        secretstorage.dbus_init.return_value = Mock(close=Mock())
+        secretstorage.get_all_collections.return_value = [collection]
+        with patch.dict("sys.modules", {"secretstorage": secretstorage}), self.assertRaisesRegex(
+            ValueError, "ambiguous"
+        ):
+            _keyring_description_password("duplicate", "Agents")
 
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
     @patch("omnigent.community.sandbox.podman.launcher.os.environ", {"GH_TOKEN": "sample-secret"})
@@ -573,6 +581,67 @@ class PodmanLauncherTests(unittest.TestCase):
     def test_no_passthrough_when_nothing_to_forward(self):
         config = PodmanConfig(image="example", network="pasta")
         self.assertNotIn("OMNIGENT_RUNNER_ENV_PASSTHROUGH", config.resolved_environment)
+
+    def test_keyring_key_accepts_collection_and_description(self):
+        config = PodmanConfig(
+            image="example",
+            keys=[{"env_var": "OPENAI_API_KEY", "keyring": "Agents", "description": "foo"}],
+        )
+        key = config.keys[0]
+        self.assertEqual((key.keyring, key.description), ("Agents", "foo"))
+
+    def test_keyring_without_description_is_rejected(self):
+        with self.assertRaisesRegex(ValidationError, "requires a description"):
+            PodmanConfig(image="example", keys=[{"env_var": "X", "keyring": "Agents"}])
+
+    def _fake_secretstorage(self, label, items, locked=False):
+        """Build a patched secretstorage module: one collection, given items."""
+        from unittest.mock import Mock, patch
+
+        collection = Mock()
+        collection.get_label.return_value = label
+        collection.is_locked.return_value = locked
+        collection.get_all_items.return_value = items
+        secretstorage = Mock()
+        secretstorage.dbus_init.return_value = Mock(close=Mock())
+        secretstorage.get_all_collections.return_value = [collection]
+        return patch.dict("sys.modules", {"secretstorage": secretstorage}), secretstorage
+
+    def test_description_lookup_reads_the_matching_item(self):
+        from unittest.mock import Mock
+        from omnigent.community.sandbox.podman.launcher import _keyring_description_password
+
+        item = Mock()
+        item.get_label.return_value = "foo"
+        item.is_locked.return_value = False
+        item.get_secret.return_value = b"bar"
+        patcher, _ = self._fake_secretstorage("Agents", [item])
+        with patcher:
+            self.assertEqual(_keyring_description_password("foo", "Agents"), "bar")
+
+    def test_description_lookup_skips_stale_items(self):
+        from unittest.mock import Mock
+        from omnigent.community.sandbox.podman.launcher import _keyring_description_password
+
+        stale, good = Mock(), Mock()
+        stale.get_label.side_effect = Exception("Item does not exist")
+        good.get_label.return_value = "foo"
+        good.is_locked.return_value = False
+        good.get_secret.return_value = b"bar"
+        patcher, _ = self._fake_secretstorage("Login", [stale, good])
+        with patcher:
+            self.assertEqual(_keyring_description_password("foo", "Login"), "bar")
+
+    def test_description_lookup_reports_locked_and_missing(self):
+        from unittest.mock import Mock
+        from omnigent.community.sandbox.podman.launcher import _keyring_description_password
+
+        patcher, _ = self._fake_secretstorage("Agents", [], locked=True)
+        with patcher, self.assertRaisesRegex(ValueError, "is locked"):
+            _keyring_description_password("foo", "Agents")
+        patcher, _ = self._fake_secretstorage("Agents", [])
+        with patcher, self.assertRaisesRegex(ValueError, "no keyring item labelled"):
+            _keyring_description_password("foo", "Agents")
 
     def test_no_fence_or_capability_change_without_deny_cidrs(self):
         launcher = PodmanSandboxLauncher(

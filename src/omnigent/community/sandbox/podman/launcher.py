@@ -7,6 +7,7 @@ rootless Podman and can use the host's configured Podman machine on macOS.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -29,27 +30,95 @@ from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 from .config import PodmanConfig, is_passthrough_network
 
 
+_LOGGER = logging.getLogger(__name__)
+
 _MANAGED_LABEL = "io.omnigent.podman-provider"
 _PROFILE_LABEL = "io.omnigent.podman-profile"
 
 
-def _keyring_label_password(label: str) -> str:
-    """Read one GNOME Login item by its visible label, never by a fuzzy match."""
+def _secret_service_items(bus: object, collection_label: str | None) -> list[object]:
+    """Return the items of one Secret Service collection (or of every one).
+
+    Enumeration is defensive on purpose: a collection can hold a *stale* item
+    path (the item was deleted while the collection index still listed it), and
+    ``get_all_items()`` then raises ``ItemNotFoundException`` for that entry,
+    aborting the whole scan. That made every label lookup in the Login
+    collection fail once, because a single vanished item sat ahead of the one
+    being looked for. Skip the bad entries, keep the good ones.
+
+    :param bus: Open Secret Service bus from ``secretstorage.dbus_init()``.
+    :param collection_label: Exact collection label to search (e.g. ``"Agents"``),
+        or ``None`` to search every collection.
+    :returns: Items from the matching, unlocked collections.
+    :raises ValueError: When a named collection is missing or locked.
+    """
+    import secretstorage
+
+    all_collections = list(secretstorage.get_all_collections(bus))
+    if collection_label is None:
+        collections = all_collections
+    else:
+        collections = [c for c in all_collections if c.get_label() == collection_label]
+        if not collections:
+            raise ValueError(f"no keyring collection named {collection_label!r}")
+    items: list[object] = []
+    for collection in collections:
+        if collection.is_locked():
+            if collection_label is None:
+                continue
+            raise ValueError(
+                f"keyring collection {collection_label!r} is locked; unlock it and retry"
+            )
+        try:
+            candidates = list(collection.get_all_items())
+        except Exception:  # noqa: BLE001 — index unreadable: skip this collection
+            continue
+        for item in candidates:
+            try:
+                item.get_label()
+            except Exception:  # noqa: BLE001 — stale item path
+                continue
+            items.append(item)
+    return items
+
+
+def _keyring_description_password(description: str, collection_label: str | None = None) -> str:
+    """Read one item by its visible label, optionally inside a named collection.
+
+    :param description: The item's label, matched exactly, e.g. ``"EnMaas key"``.
+    :param collection_label: Collection to search (e.g. ``"Agents"``); ``None``
+        searches every unlocked collection.
+    :returns: The stored secret as text.
+    :raises ValueError: Missing/locked collection, no match, or several matches.
+    """
     if sys.platform != "linux":
-        raise ValueError("item-label lookup requires Linux Secret Service")
+        raise ValueError("keyring lookups require Linux Secret Service")
     import secretstorage
 
     with closing(secretstorage.dbus_init()) as bus:
-        collection = secretstorage.get_default_collection(bus)
-        if collection.is_locked():
-            raise ValueError("Login collection is locked")
-        matches = [item for item in collection.get_all_items() if item.get_label() == label]
+        matches = []
+        for item in _secret_service_items(bus, collection_label):
+            try:
+                if item.get_label() == description:
+                    matches.append(item)
+            except Exception:  # noqa: BLE001 — stale item path
+                continue
+        where = f"collection {collection_label!r}" if collection_label else "any collection"
+        if not matches:
+            raise ValueError(f"no keyring item labelled {description!r} in {where}")
         if len(matches) != 1:
-            raise ValueError("item label must match exactly one Login item")
+            raise ValueError(
+                f"keyring item label {description!r} is ambiguous ({len(matches)} matches)"
+            )
         item = matches[0]
         if item.is_locked():
-            raise ValueError("keyring item is locked")
+            raise ValueError(f"keyring item {description!r} is locked")
         return item.get_secret().decode("utf-8")
+
+
+def _keyring_label_password(label: str) -> str:
+    """Read one item by label from any unlocked collection (legacy form)."""
+    return _keyring_description_password(label, None)
 
 
 class PodmanSandboxLauncher(ExecModelHostLauncher):
@@ -69,14 +138,22 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         values: dict[str, str] = {}
         for key in self.config.keys:
             try:
-                if key.item_label is None:
+                if key.description is not None:
+                    value = _keyring_description_password(key.description, key.keyring)
+                elif key.item_label is not None:
+                    value = _keyring_label_password(key.item_label)
+                else:
                     assert key.key_name is not None  # validated by KeyringKey
-                value = (
-                    _keyring_label_password(key.item_label)
-                    if key.item_label is not None
-                    else keyring.get_password(key.service, key.key_name)
+                    value = keyring.get_password(key.service, key.key_name)
+            except Exception as exc:
+                # The message stays generic on purpose: keyring backends echo
+                # lookups and paths, and this string reaches the UI/logs.
+                _LOGGER.debug(
+                    "keyring lookup failed for %s: %s: %s",
+                    key.env_var,
+                    type(exc).__name__,
+                    exc,
                 )
-            except Exception:
                 raise click.ClickException(
                     f"Cannot read keyring entry for {key.env_var}"
                 ) from None

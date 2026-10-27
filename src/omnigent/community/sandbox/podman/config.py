@@ -68,7 +68,24 @@ class BindMount(BaseModel):
 
 
 class KeyringKey(BaseModel):
-    """Map a host keyring credential to a container process variable."""
+    """Map a host keyring credential to a container process variable.
+
+    Three lookup shapes, most specific first:
+
+    - ``keyring`` + ``description`` — an item whose *label* is ``description``
+      inside the Secret Service collection named ``keyring`` (e.g. a dedicated
+      ``Agents`` collection holding agent credentials::
+
+          keys:
+            - env_var: OPENAI_API_KEY
+              keyring: Agents
+              description: EnMaas key
+
+      ``keyring`` alone means "the default collection".
+    - ``item_label`` — an item label in the default collection (legacy form).
+    - ``key_name`` + ``service`` — the ``keyring`` module's service/account
+      lookup, the most portable shape.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -76,6 +93,8 @@ class KeyringKey(BaseModel):
     env_var: str
     service: str = Field(default="omnigent-podman-provider", min_length=1)
     item_label: str | None = Field(default=None, min_length=1)
+    keyring: str | None = Field(default=None, min_length=1)
+    description: str | None = Field(default=None, min_length=1)
 
     @field_validator("env_var")
     @classmethod
@@ -86,8 +105,10 @@ class KeyringKey(BaseModel):
 
     @model_validator(mode="after")
     def validate_lookup(self) -> "KeyringKey":
-        if self.key_name is None and self.item_label is None:
-            raise ValueError("key_name or item_label is required")
+        if self.keyring is not None and self.description is None:
+            raise ValueError("keyring requires a description (the item label)")
+        if self.key_name is None and self.item_label is None and self.description is None:
+            raise ValueError("one of key_name, item_label, or description is required")
         return self
 
 
