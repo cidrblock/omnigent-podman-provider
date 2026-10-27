@@ -280,9 +280,14 @@ class PodmanConfig(BaseModel):
             for name in env.get(passthrough_name, "").split(",")
             if name.strip()
         ]
-        derived = [key.env_var for key in self.keys] + [
-            name for name in env if name != passthrough_name
-        ]
+        # env: names are passed through from the server env, environment: and
+        # keys: names are set by this provider — all three are meant for the
+        # agent, so all three belong in the passthrough.
+        derived = (
+            [key.env_var for key in self.keys]
+            + [name for name in self.env]
+            + [name for name in env if name != passthrough_name]
+        )
         merged = list(dict.fromkeys([*explicit, *derived]))
         if merged:
             env[passthrough_name] = ",".join(merged)

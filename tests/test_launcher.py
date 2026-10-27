@@ -578,6 +578,12 @@ class PodmanLauncherTests(unittest.TestCase):
         self.assertIn("GOOSE_MODEL", passthrough)
         self.assertNotIn("OMNIGENT_RUNNER_ENV_PASSTHROUGH", passthrough)
 
+    def test_runner_passthrough_includes_env_names(self):
+        config = PodmanConfig(image="example", network="pasta", env=["JIRA_USERNAME", "GH_TOKEN"])
+        passthrough = config.resolved_environment["OMNIGENT_RUNNER_ENV_PASSTHROUGH"].split(",")
+        self.assertIn("JIRA_USERNAME", passthrough)
+        self.assertIn("GH_TOKEN", passthrough)
+
     def test_no_passthrough_when_nothing_to_forward(self):
         config = PodmanConfig(image="example", network="pasta")
         self.assertNotIn("OMNIGENT_RUNNER_ENV_PASSTHROUGH", config.resolved_environment)
