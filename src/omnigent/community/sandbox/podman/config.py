@@ -99,6 +99,7 @@ class PodmanConfig(BaseModel):
     runtime_user: str | None = Field(default=None, min_length=1)
     runtime_home: str = Field(default="/root", min_length=2)
     env: list[str] = Field(default_factory=list)
+    environment: dict[str, str] = Field(default_factory=dict)
     binary: str = Field(default="podman", min_length=1)
     entrypoint: str | None = None
     require_rootless: bool = True
@@ -137,6 +138,17 @@ class PodmanConfig(BaseModel):
         if set(names) & set(self.env):
             raise ValueError("keyring env_var names cannot also appear in env")
         return self
+
+    @field_validator("environment")
+    @classmethod
+    def validate_environment(cls, values: dict[str, str]) -> dict[str, str]:
+        """Literal env values for the container, distinct from ``env`` passthrough."""
+        for name, value in values.items():
+            if not _ENV_NAME.fullmatch(name):
+                raise ValueError(f"environment key is not an env var name: {name!r}")
+            if "\x00" in value or "\n" in value:
+                raise ValueError(f"environment {name!r} value cannot contain NUL or newline")
+        return values
 
     @field_validator("cap_drop")
     @classmethod

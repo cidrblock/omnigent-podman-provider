@@ -159,6 +159,8 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         for name, value in self.config.annotations.items():
             args.extend(["--annotation", f"{name}={value}"])
         args.extend(option for key in self.config.env if key in os.environ for option in ("--env", key))
+        for key, value in self.config.environment.items():
+            args.extend(["--env", f"{key}={value}"])
         for mount in self.config.mounts:
             source = mount.source
             if mount.per_session:

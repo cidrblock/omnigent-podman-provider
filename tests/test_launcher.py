@@ -500,6 +500,30 @@ class PodmanLauncherTests(unittest.TestCase):
         drops = [create[i + 1] for i, arg in enumerate(create) if arg == "--cap-drop"]
         self.assertEqual(drops, ["NET_ADMIN", "NET_RAW"])
 
+    def test_environment_literals_are_validated(self):
+        with self.assertRaisesRegex(ValidationError, "environment key"):
+            PodmanConfig(image="example", environment={"bad key": "x"})
+        config = PodmanConfig(
+            image="example", environment={"OMNIGENT_CONFIG_HOME": "/opt/provider"}
+        )
+        self.assertEqual(config.environment["OMNIGENT_CONFIG_HOME"], "/opt/provider")
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_environment_literals_reach_create(self, run):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(
+                image="example",
+                network="pasta",
+                environment={"OMNIGENT_CONFIG_HOME": "/opt/provider"},
+            )
+        )
+        run.side_effect = [
+            completed([], stdout="container-id"), completed([]), completed([], stdout="sleep")
+        ]
+        launcher.provision("session")
+        create = run.call_args_list[0].args[0]
+        self.assertIn("OMNIGENT_CONFIG_HOME=/opt/provider", create)
+
     def test_no_fence_or_capability_change_without_deny_cidrs(self):
         launcher = PodmanSandboxLauncher(
             config=PodmanConfig(image="example", network="pasta")
