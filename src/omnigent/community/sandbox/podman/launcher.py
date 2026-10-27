@@ -85,7 +85,7 @@ def _secret_service_items(bus: object, collection_label: str | None) -> list[obj
 def _keyring_description_password(description: str, collection_label: str | None = None) -> str:
     """Read one item by its visible label, optionally inside a named collection.
 
-    :param description: The item's label, matched exactly, e.g. ``"EnMaas key"``.
+    :param description: The item's label, matched exactly, e.g. ``"app"``.
     :param collection_label: Collection to search (e.g. ``"Agents"``); ``None``
         searches every unlocked collection.
     :returns: The stored secret as text.

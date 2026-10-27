@@ -79,7 +79,7 @@ class KeyringKey(BaseModel):
           keys:
             - env_var: OPENAI_API_KEY
               keyring: Agents
-              description: EnMaas key
+              description: app
 
       ``keyring`` alone means "the default collection".
     - ``item_label`` — an item label in the default collection (legacy form).
@@ -263,7 +263,7 @@ class PodmanConfig(BaseModel):
         only allowlisted names, harness credential names, names the sandbox
         config references, and names listed in
         ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` survive. A harness that reads its
-        own variables (e.g. Goose's ``GOOSE_PROVIDER__*`` / ``GOOSE_MODEL``)
+        own variables (for example a vendor CLI's ``PROVIDER_*`` / ``MODEL``)
         would otherwise lose them between container and harness.
 
         Everything this provider puts in the container environment is meant for

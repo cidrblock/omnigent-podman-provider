@@ -1,0 +1,16 @@
+{
+  "version": "1.0.0",
+  "hook": {
+    "path": "/home/USER/.local/bin/podman-egress-fence.sh",
+    "args": ["podman-egress-fence.sh"],
+    "env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ]
+  },
+  "when": {
+    "annotations": {
+      "apply-firewall": "true"
+    }
+  },
+  "stages": ["createContainer"]
+}

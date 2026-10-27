@@ -108,7 +108,7 @@ class PodmanLauncherTests(unittest.TestCase):
             PodmanConfig(image="test", env=["GH_TOKEN", "GH_TOKEN"])
 
     def test_keyring_config_rejects_duplicate_or_persisted_env_names(self):
-        key = {"key_name": "enmaas", "env_var": "ENMAAS_KEY"}
+        key = {"key_name": "app", "env_var": "APP_API_KEY"}
         with self.assertRaises(ValidationError):
             PodmanConfig(image="test", keys=[{"env_var": "SAMPLE_KEY"}])
         with self.assertRaises(ValidationError):
@@ -116,7 +116,7 @@ class PodmanLauncherTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             PodmanConfig(image="test", keys=[key, key])
         with self.assertRaises(ValidationError):
-            PodmanConfig(image="test", env=["ENMAAS_KEY"], keys=[key])
+            PodmanConfig(image="test", env=["APP_API_KEY"], keys=[key])
 
     def test_mounts_require_absolute_nonoverlapping_paths(self):
         for source, target in (("relative", "/root/scratch"), ("/tmp/one", "../scratch"),
@@ -283,7 +283,7 @@ class PodmanLauncherTests(unittest.TestCase):
     @patch("omnigent.community.sandbox.podman.launcher.keyring.get_password", return_value="host-secret")
     def test_bootstrap_receives_key_without_storing_it_in_podman_config(self, _get_password, run):
         launcher = PodmanSandboxLauncher(config=PodmanConfig(
-            image="test", keys=[{"key_name": "enmaas", "env_var": "ENMAAS_KEY"}],
+            image="test", keys=[{"key_name": "app", "env_var": "APP_API_KEY"}],
             bootstrap_command="/usr/local/bin/omnigent-guest-init /bin/true",
         ))
         run.side_effect = [completed([], stdout="container-id"), completed([]),
@@ -295,10 +295,10 @@ class PodmanLauncherTests(unittest.TestCase):
         # still inherit it.
         self.assertNotIn("host-secret", str(create))
         env_args = [create[i + 1] for i, a in enumerate(create) if a == "--env"]
-        self.assertEqual(env_args, ["OMNIGENT_RUNNER_ENV_PASSTHROUGH=ENMAAS_KEY"])
+        self.assertEqual(env_args, ["OMNIGENT_RUNNER_ENV_PASSTHROUGH=APP_API_KEY"])
         bootstrap = run.call_args_list[3]
         self.assertEqual(bootstrap.args[0][1:3], ["exec", "-i"])
-        self.assertIn("export ENMAAS_KEY=host-secret", bootstrap.kwargs["input"])
+        self.assertIn("export APP_API_KEY=host-secret", bootstrap.kwargs["input"])
         self.assertIn("omnigent-guest-init /bin/true", bootstrap.kwargs["input"])
 
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
@@ -564,18 +564,18 @@ class PodmanLauncherTests(unittest.TestCase):
         config = PodmanConfig(
             image="example",
             network="pasta",
-            keys=[{"item_label": "EnMaas key", "env_var": "GOOSE_PROVIDER__API_KEY"}],
+            keys=[{"item_label": "app", "env_var": "APP_API_KEY"}],
             environment={
-                "GOOSE_PROVIDER__TYPE": "openai",
-                "GOOSE_MODEL": "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+                "HARNESS_PROVIDER": "openai",
+                "HARNESS_MODEL": "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017",
                 "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "GH_TOKEN",
             },
         )
         passthrough = config.resolved_environment["OMNIGENT_RUNNER_ENV_PASSTHROUGH"].split(",")
         self.assertEqual(passthrough[0], "GH_TOKEN")  # explicit value keeps its place
-        self.assertIn("GOOSE_PROVIDER__API_KEY", passthrough)
-        self.assertIn("GOOSE_PROVIDER__TYPE", passthrough)
-        self.assertIn("GOOSE_MODEL", passthrough)
+        self.assertIn("APP_API_KEY", passthrough)
+        self.assertIn("HARNESS_PROVIDER", passthrough)
+        self.assertIn("HARNESS_MODEL", passthrough)
         self.assertNotIn("OMNIGENT_RUNNER_ENV_PASSTHROUGH", passthrough)
 
     def test_runner_passthrough_includes_env_names(self):
