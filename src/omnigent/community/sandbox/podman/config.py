@@ -8,6 +8,24 @@ from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_IPV4_CIDR = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?:/[0-9]{1,2})?\Z")
+# Podman forwards everything after ``mode:`` to the mode's own process, so a
+# network value may carry options (``pasta:--map-host-loopback=169.254.170.2``).
+_NETWORK_WITH_OPTIONS = re.compile(r"(?:pasta|slirp4netns):\S+\Z")
+_PASTA_HOST_LOOPBACK = re.compile(r"--map-host-loopback(?:=|\s+)([0-9.]+)")
+
+
+def is_passthrough_network(network: str) -> bool:
+    """Return whether *network* is a mode that carries its own options.
+
+    :param network: The configured ``network`` value, e.g. ``"pasta"`` or
+        ``"pasta:--map-host-loopback=169.254.170.2"``.
+    :returns: ``True`` for a bare or option-carrying pasta/slirp4netns mode,
+        i.e. a value Podman accepts verbatim rather than a named Podman network.
+    """
+    return network in {"host", "bridge", "pasta", "slirp4netns"} or bool(
+        _NETWORK_WITH_OPTIONS.fullmatch(network)
+    )
 
 
 class BindMount(BaseModel):
@@ -68,6 +86,7 @@ class PodmanConfig(BaseModel):
     image: str = Field(min_length=1)
     provider_id: Literal["podman"] = Field(default="podman", exclude=True)
     network: str = Field(default="host", min_length=1)
+    deny_cidrs: list[str] = Field(default_factory=list)
     env: list[str] = Field(default_factory=list)
     binary: str = Field(default="podman", min_length=1)
     entrypoint: str | None = None
@@ -107,6 +126,52 @@ class PodmanConfig(BaseModel):
         if set(names) & set(self.env):
             raise ValueError("keyring env_var names cannot also appear in env")
         return self
+
+    @field_validator("deny_cidrs")
+    @classmethod
+    def validate_deny_cidrs(cls, cidrs: list[str]) -> list[str]:
+        """Keep the fence script free of anything a shell or nft could misread."""
+        if len(cidrs) != len(set(cidrs)):
+            raise ValueError("deny_cidrs must be unique")
+        for cidr in cidrs:
+            if not _IPV4_CIDR.fullmatch(cidr):
+                raise ValueError(f"deny_cidrs entry must be an IPv4 address or CIDR: {cidr!r}")
+            octets, _, prefix = cidr.partition("/")
+            if any(octet > 255 for octet in (int(part) for part in octets.split("."))):
+                raise ValueError(f"deny_cidrs entry has an invalid octet: {cidr!r}")
+            if prefix and not 0 <= int(prefix) <= 32:
+                raise ValueError(f"deny_cidrs entry has an invalid prefix length: {cidr!r}")
+        return cidrs
+
+    @model_validator(mode="after")
+    def validate_fence_network(self) -> "PodmanConfig":
+        """Refuse a fence that would land outside this sandbox's own netns.
+
+        ``deny_cidrs`` is installed inside the container's network namespace.
+        With ``network: host`` (rootless) the container joins the per-user
+        rootless namespace instead, so a drop rule there would fence every
+        rootless container on the machine, not just this session.
+        """
+        if self.deny_cidrs and not self.network.startswith(("pasta", "slirp4netns")):
+            raise ValueError("deny_cidrs requires network: pasta:… or slirp4netns:…")
+        return self
+
+    @property
+    def host_loopback_addresses(self) -> list[str]:
+        """Addresses the network string maps to the host's loopback interface.
+
+        Connections the sandbox makes to these addresses reach services bound
+        to ``127.0.0.1`` on the host (the Omnigent server and its per-session
+        tool relay), so they must survive the egress fence.
+
+        :returns: De-duplicated addresses from ``--map-host-loopback`` options,
+            in configuration order.
+        """
+        seen: list[str] = []
+        for address in _PASTA_HOST_LOOPBACK.findall(self.network):
+            if address not in seen:
+                seen.append(address)
+        return seen
 
 
 def profile_config_model(provider_id: str) -> type[PodmanConfig]:

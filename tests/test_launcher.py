@@ -351,6 +351,78 @@ class PodmanLauncherTests(unittest.TestCase):
         with self.assertRaisesRegex(click.ClickException, "could not inspect"):
             self.launcher.resume("container-id")
 
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_pasta_network_with_options_skips_named_network_lookup(self, run):
+        """A ``pasta:…`` value is a mode plus options, not a named network."""
+        config = PodmanConfig(
+            image="example", network="pasta:--map-host-loopback=169.254.170.2"
+        )
+        launcher = PodmanSandboxLauncher(config=config)
+        run.side_effect = [completed([], stdout="true"), completed([])]
+        launcher.prepare()
+        self.assertNotIn("network", run.call_args_list[1].args[0][1:2])
+        self.assertEqual(run.call_args_list[1].args[0][1:3], ["image", "exists"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_unknown_named_network_still_fails(self, run):
+        launcher = PodmanSandboxLauncher(config=PodmanConfig(image="example", network="mynet"))
+        run.side_effect = [completed([], stdout="true"), completed([]), completed([], code=1)]
+        with self.assertRaisesRegex(click.ClickException, "network is unavailable"):
+            launcher.prepare()
+
+    def test_deny_cidrs_requires_a_private_netns_mode(self):
+        with self.assertRaisesRegex(ValidationError, "requires network"):
+            PodmanConfig(image="example", deny_cidrs=["192.168.0.0/24"])
+
+    def test_deny_cidrs_rejects_shell_metacharacters(self):
+        for bad in ["192.168.0.0/24 ; rm -rf /", "$(id)", "192.168.0.0/33", "1.2.3.999"]:
+            with self.assertRaisesRegex(ValidationError, "deny_cidrs"):
+                PodmanConfig(
+                    image="example", network="pasta", deny_cidrs=[bad]
+                )
+
+    def test_host_loopback_addresses_are_parsed_from_the_network_string(self):
+        config = PodmanConfig(
+            image="example",
+            network="pasta:--map-host-loopback=169.254.170.2 --map-host-loopback=169.254.170.3",
+        )
+        self.assertEqual(
+            config.host_loopback_addresses, ["169.254.170.2", "169.254.170.3"]
+        )
+        self.assertEqual(PodmanConfig(image="example", network="pasta").host_loopback_addresses, [])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_fence_is_installed_before_the_bootstrap_command(self, run):
+        config = PodmanConfig(
+            image="example",
+            network="pasta:--map-host-loopback=169.254.170.2",
+            deny_cidrs=["192.168.0.0/24"],
+            bootstrap_command="/usr/local/bin/omnigent-guest-init /bin/true",
+        )
+        launcher = PodmanSandboxLauncher(config=config)
+        run.side_effect = [
+            completed([], stdout="container-id"),
+            completed([]),  # start
+            completed([], stdout="sleep"),  # readiness probe
+            completed([]),  # fence
+            completed([]),  # bootstrap
+        ]
+        launcher.provision("session")
+        create = run.call_args_list[0].args[0]
+        self.assertIn("--cap-add", create)
+        self.assertEqual(create[create.index("--cap-add") + 1], "NET_ADMIN")
+        fence_call, bootstrap_call = run.call_args_list[3], run.call_args_list[4]
+        self.assertIn("nft add rule inet omnigent_egress out ip daddr 169.254.170.2 accept", fence_call.kwargs["input"])
+        self.assertIn("nft add rule inet omnigent_egress out ip daddr 192.168.0.0/24 drop", fence_call.kwargs["input"])
+        self.assertIn("omnigent-guest-init", bootstrap_call.kwargs["input"])
+
+    def test_no_fence_or_capability_change_without_deny_cidrs(self):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(image="example", network="pasta")
+        )
+        self.assertEqual(launcher._egress_fence_script().count("drop"), 0)
+
+
 
 if __name__ == "__main__":
     unittest.main()

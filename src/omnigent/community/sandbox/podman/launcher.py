@@ -26,7 +26,7 @@ from omnigent.onboarding.sandboxes.base import (
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 
-from .config import PodmanConfig
+from .config import PodmanConfig, is_passthrough_network
 
 
 _MANAGED_LABEL = "io.omnigent.podman-provider"
@@ -126,7 +126,7 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         image = self._podman("image", "exists", self.config.image)
         if image.returncode:
             raise click.ClickException(f"Podman image is unavailable: {self.config.image}")
-        if self.config.network not in {"host", "bridge", "pasta", "slirp4netns"}:
+        if not is_passthrough_network(self.config.network):
             if self._podman("network", "exists", self.config.network).returncode:
                 raise click.ClickException(f"Podman network is unavailable: {self.config.network}")
         for mount in self.config.mounts:
@@ -146,6 +146,12 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             "--label", f"io.omnigent.session-name={safe_name}",
             "--network", self.config.network,
         ]
+        # The fence is installed by an exec after the container is up, so the
+        # process that runs nft needs NET_ADMIN. The sandbox therefore keeps
+        # that capability for its lifetime: the fence is an accident guardrail
+        # for a trusted agent, not a boundary against a hostile one.
+        if self.config.deny_cidrs:
+            args.extend(["--cap-add", "NET_ADMIN"])
         args.extend(option for key in self.config.env if key in os.environ for option in ("--env", key))
         for mount in self.config.mounts:
             source = mount.source
@@ -178,6 +184,8 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
                     'test "$(cat /proc/1/comm)" = sleep', timeout=10,
                 )
                 if ready.returncode == 0:
+                    if self.config.deny_cidrs:
+                        self.run(container_id, self._egress_fence_script())
                     if self.config.bootstrap_command:
                         self.run(container_id, self.config.bootstrap_command)
                     return container_id
@@ -187,6 +195,30 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             raise
         self._podman("rm", "--force", container_id)
         raise click.ClickException("Podman sandbox bootstrap did not complete")
+
+    def _egress_fence_script(self) -> str:
+        """Build the nft script that blocks ``deny_cidrs`` inside the sandbox.
+
+        Runs once, from :meth:`provision`, before the image bootstrap and before
+        any agent command. The rules live in the container's network namespace,
+        so they disappear with the container and cannot leak into the host's.
+        Host-loopback mappings from ``network`` are accepted ahead of the drops
+        so the Omnigent bridge keeps working while the LAN is fenced off.
+
+        :returns: A POSIX shell script for :meth:`run`.
+        """
+        table = "inet omnigent_egress"
+        lines = [
+            "set -eu",
+            f"nft add table {table} 2>/dev/null || true",
+            f"nft flush table {table}",
+            f"nft add chain {table} out '{{ type filter hook output priority 0 ; }}'",
+        ]
+        for address in self.config.host_loopback_addresses:
+            lines.append(f"nft add rule {table} out ip daddr {address} accept")
+        for cidr in self.config.deny_cidrs:
+            lines.append(f"nft add rule {table} out ip daddr {cidr} drop")
+        return "\n".join(lines)
 
     def run(
         self, sandbox_id: str, command: str, *, check: bool = True
