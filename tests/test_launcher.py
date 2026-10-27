@@ -467,6 +467,39 @@ class PodmanLauncherTests(unittest.TestCase):
         self.assertIn("root", fence)
         self.assertNotIn("agent", fence)
 
+    def test_annotations_must_be_plain_dotted_keys(self):
+        with self.assertRaisesRegex(ValidationError, "annotation name"):
+            PodmanConfig(image="example", annotations={"bad key": "true"})
+        config = PodmanConfig(image="example", annotations={"apply-firewall": "true"})
+        self.assertEqual(config.annotations, {"apply-firewall": "true"})
+
+    def test_cap_drop_is_allowlisted(self):
+        with self.assertRaisesRegex(ValidationError, "cap_drop"):
+            PodmanConfig(image="example", cap_drop=["SYS_ADMIN"])
+        self.assertEqual(
+            PodmanConfig(image="example", cap_drop=["NET_ADMIN", "NET_RAW"]).cap_drop,
+            ["NET_ADMIN", "NET_RAW"],
+        )
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_annotations_and_cap_drop_reach_create(self, run):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(
+                image="example",
+                network="pasta",
+                annotations={"apply-firewall": "true"},
+                cap_drop=["NET_ADMIN", "NET_RAW"],
+            )
+        )
+        run.side_effect = [
+            completed([], stdout="container-id"), completed([]), completed([], stdout="sleep")
+        ]
+        launcher.provision("session")
+        create = run.call_args_list[0].args[0]
+        self.assertEqual(create[create.index("--annotation") + 1], "apply-firewall=true")
+        drops = [create[i + 1] for i, arg in enumerate(create) if arg == "--cap-drop"]
+        self.assertEqual(drops, ["NET_ADMIN", "NET_RAW"])
+
     def test_no_fence_or_capability_change_without_deny_cidrs(self):
         launcher = PodmanSandboxLauncher(
             config=PodmanConfig(image="example", network="pasta")

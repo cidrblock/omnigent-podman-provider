@@ -154,6 +154,10 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             args.extend(["--cap-add", "NET_ADMIN"])
         for capability in self.config.cap_add:
             args.extend(["--cap-add", capability])
+        for capability in self.config.cap_drop:
+            args.extend(["--cap-drop", capability])
+        for name, value in self.config.annotations.items():
+            args.extend(["--annotation", f"{name}={value}"])
         args.extend(option for key in self.config.env if key in os.environ for option in ("--env", key))
         for mount in self.config.mounts:
             source = mount.source

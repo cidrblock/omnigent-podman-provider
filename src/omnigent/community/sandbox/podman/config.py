@@ -12,6 +12,9 @@ _IPV4_CIDR = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?:/[0-9]{1,2})?\Z")
 #: Capabilities an operator may grant. Deliberately tiny: NET_ADMIN is what an
 #: entrypoint needs to install an egress fence, NET_RAW for diagnostic tooling.
 _ALLOWED_CAP_ADD = frozenset({"NET_ADMIN", "NET_RAW"})
+#: Annotation names an operator may set. Podman passes these to the OCI spec,
+#: where hooks can gate on them (e.g. ``apply-firewall=true``).
+_ANNOTATION_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,126}\Z")
 # Podman forwards everything after ``mode:`` to the mode's own process, so a
 # network value may carry options (``pasta:--map-host-loopback=169.254.170.2``).
 _NETWORK_WITH_OPTIONS = re.compile(r"(?:pasta|slirp4netns):\S+\Z")
@@ -91,6 +94,8 @@ class PodmanConfig(BaseModel):
     network: str = Field(default="host", min_length=1)
     deny_cidrs: list[str] = Field(default_factory=list)
     cap_add: list[str] = Field(default_factory=list)
+    cap_drop: list[str] = Field(default_factory=list)
+    annotations: dict[str, str] = Field(default_factory=dict)
     runtime_user: str | None = Field(default=None, min_length=1)
     runtime_home: str = Field(default="/root", min_length=2)
     env: list[str] = Field(default_factory=list)
@@ -132,6 +137,28 @@ class PodmanConfig(BaseModel):
         if set(names) & set(self.env):
             raise ValueError("keyring env_var names cannot also appear in env")
         return self
+
+    @field_validator("cap_drop")
+    @classmethod
+    def validate_cap_drop(cls, caps: list[str]) -> list[str]:
+        """Dropping is always safe, so anything Podman accepts is allowed here."""
+        if len(caps) != len(set(caps)):
+            raise ValueError("cap_drop must be unique")
+        unknown = set(caps) - _ALLOWED_CAP_ADD
+        if unknown:
+            raise ValueError(f"cap_drop only accepts {sorted(_ALLOWED_CAP_ADD)}")
+        return caps
+
+    @field_validator("annotations")
+    @classmethod
+    def validate_annotations(cls, values: dict[str, str]) -> dict[str, str]:
+        """Keep annotation names and values free of argv/spec surprises."""
+        for name, value in values.items():
+            if not _ANNOTATION_NAME.fullmatch(name):
+                raise ValueError(f"annotation name is not a plain dotted key: {name!r}")
+            if "\x00" in value or "\n" in value:
+                raise ValueError(f"annotation {name!r} value cannot contain NUL or newline")
+        return values
 
     @field_validator("runtime_user")
     @classmethod
