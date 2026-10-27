@@ -235,6 +235,39 @@ class PodmanConfig(BaseModel):
         return self
 
     @property
+    def resolved_environment(self) -> dict[str, str]:
+        """Container env with ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` derived.
+
+        The server's runner spawns a harness with a filtered environment:
+        only allowlisted names, harness credential names, names the sandbox
+        config references, and names listed in
+        ``OMNIGENT_RUNNER_ENV_PASSTHROUGH`` survive. A harness that reads its
+        own variables (e.g. Goose's ``GOOSE_PROVIDER__*`` / ``GOOSE_MODEL``)
+        would otherwise lose them between container and harness.
+
+        Everything this provider puts in the container environment is meant for
+        the agent, so derive the passthrough from it: every ``keys:`` variable
+        plus every ``environment:`` name, merged with any explicit value the
+        operator set (their order first).
+
+        :returns: The env mapping to pass to ``podman create``.
+        """
+        env = dict(self.environment)
+        passthrough_name = "OMNIGENT_RUNNER_ENV_PASSTHROUGH"
+        explicit = [
+            name.strip()
+            for name in env.get(passthrough_name, "").split(",")
+            if name.strip()
+        ]
+        derived = [key.env_var for key in self.keys] + [
+            name for name in env if name != passthrough_name
+        ]
+        merged = list(dict.fromkeys([*explicit, *derived]))
+        if merged:
+            env[passthrough_name] = ",".join(merged)
+        return env
+
+    @property
     def host_loopback_addresses(self) -> list[str]:
         """Addresses the network string maps to the host's loopback interface.
 

@@ -282,8 +282,12 @@ class PodmanLauncherTests(unittest.TestCase):
                            completed([]), completed([])]
         launcher.provision("session")
         create = run.call_args_list[0].args[0]
-        self.assertNotIn("ENMAAS_KEY", str(create))
+        # The value never reaches podman create; the *name* may appear once, in
+        # the derived OMNIGENT_RUNNER_ENV_PASSTHROUGH line, so the harness can
+        # still inherit it.
         self.assertNotIn("host-secret", str(create))
+        env_args = [create[i + 1] for i, a in enumerate(create) if a == "--env"]
+        self.assertEqual(env_args, ["OMNIGENT_RUNNER_ENV_PASSTHROUGH=ENMAAS_KEY"])
         bootstrap = run.call_args_list[3]
         self.assertEqual(bootstrap.args[0][1:3], ["exec", "-i"])
         self.assertIn("export ENMAAS_KEY=host-secret", bootstrap.kwargs["input"])
@@ -547,6 +551,28 @@ class PodmanLauncherTests(unittest.TestCase):
             host_file.write_text("x\n")
             with self.assertRaisesRegex(ValidationError, "must be directories"):
                 BindMount(source=host_file, target="/root/x", mode="rw", per_session=True)
+
+    def test_runner_passthrough_is_derived_from_env_and_keys(self):
+        config = PodmanConfig(
+            image="example",
+            network="pasta",
+            keys=[{"item_label": "EnMaas key", "env_var": "GOOSE_PROVIDER__API_KEY"}],
+            environment={
+                "GOOSE_PROVIDER__TYPE": "openai",
+                "GOOSE_MODEL": "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+                "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "GH_TOKEN",
+            },
+        )
+        passthrough = config.resolved_environment["OMNIGENT_RUNNER_ENV_PASSTHROUGH"].split(",")
+        self.assertEqual(passthrough[0], "GH_TOKEN")  # explicit value keeps its place
+        self.assertIn("GOOSE_PROVIDER__API_KEY", passthrough)
+        self.assertIn("GOOSE_PROVIDER__TYPE", passthrough)
+        self.assertIn("GOOSE_MODEL", passthrough)
+        self.assertNotIn("OMNIGENT_RUNNER_ENV_PASSTHROUGH", passthrough)
+
+    def test_no_passthrough_when_nothing_to_forward(self):
+        config = PodmanConfig(image="example", network="pasta")
+        self.assertNotIn("OMNIGENT_RUNNER_ENV_PASSTHROUGH", config.resolved_environment)
 
     def test_no_fence_or_capability_change_without_deny_cidrs(self):
         launcher = PodmanSandboxLauncher(
