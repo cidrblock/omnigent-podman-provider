@@ -161,6 +161,28 @@ agent_workspace_root: /home/USER/agent_work
   leaves a container-private MCS label on the host directory) is never applied,
   because it would lock a re-provisioned sandbox out of its own old workspace.
 
+### Sandbox survival across a service restart
+
+A container's `conmon` inherits the cgroup of the command that started it. When
+the server runs as a systemd unit, that is the unit's own cgroup, so stopping the
+unit signals `conmon` too: it ignores SIGTERM by design, the stop runs into its
+timeout, and the sandbox is left with only `lo` and no route while `podman ps`
+still reports the container as `Up`.
+
+```yaml
+systemd_scope: true
+```
+
+starts containers inside a transient systemd scope (`systemd-run --user --scope`),
+so `conmon` and `pasta` live outside the server's cgroup and a restart of the
+server no longer touches them. Only the container start takes a scope — that is
+the call that spawns `conmon`; `podman create` runs normally.
+
+This is opt-in because it needs a systemd user manager. On a host without
+`systemd-run` (a macOS Podman machine, a plain shell) the provider falls back to
+starting in-process, and `prepare()` reports the problem explicitly when
+`systemd_scope` is on but the CLI is missing rather than failing at launch.
+
 ### Credentials
 
 Three shapes, most specific first:

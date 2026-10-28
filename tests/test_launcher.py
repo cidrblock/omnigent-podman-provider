@@ -252,6 +252,79 @@ class PodmanLauncherTests(unittest.TestCase):
             launcher.terminate("container-id")
             self.assertEqual((workspace / "report.md").read_text(), "findings\n")
 
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_start_uses_a_transient_scope_when_enabled(self, run):
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+            with patch("omnigent.community.sandbox.podman.launcher.shutil.which",
+                       side_effect=lambda name: f"/usr/bin/{name}"):
+                launcher = PodmanSandboxLauncher(
+                    config=PodmanConfig(image="test", systemd_scope=True)
+                )
+                run.side_effect = [completed([], stdout="container-id"),
+                                   completed([]), completed([])]
+                launcher.provision("session")
+        create = run.call_args_list[0].args[0]
+        start = run.call_args_list[1].args[0]
+        # Only the start spawns conmon, so only the start needs the scope.
+        self.assertEqual(create[:2], ["podman", "create"])
+        self.assertEqual(start[:6], ["/usr/bin/systemd-run", "--user", "--scope",
+                                     "--collect", "--quiet", "--unit"])
+        self.assertTrue(start[6].startswith("omni-session-"))
+        self.assertEqual(start[7:9], ["podman", "start"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_start_stays_in_process_without_systemd_run(self, run):
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+            with patch("omnigent.community.sandbox.podman.launcher.shutil.which",
+                       return_value=None):
+                launcher = PodmanSandboxLauncher(
+                    config=PodmanConfig(image="test", systemd_scope=True)
+                )
+                run.side_effect = [completed([], stdout="container-id"),
+                                   completed([]), completed([])]
+                launcher.provision("session")
+        self.assertEqual(run.call_args_list[1].args[0][:2], ["podman", "start"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_start_stays_in_process_when_scope_is_off(self, run):
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+            with patch("omnigent.community.sandbox.podman.launcher.shutil.which",
+                       side_effect=lambda name: f"/usr/bin/{name}"):
+                launcher = PodmanSandboxLauncher(config=PodmanConfig(image="test"))
+                run.side_effect = [completed([], stdout="container-id"),
+                                   completed([]), completed([])]
+                launcher.provision("session")
+        self.assertEqual(run.call_args_list[1].args[0][:2], ["podman", "start"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_resume_also_uses_a_transient_scope(self, run):
+        inspect = json.dumps([{
+            "Config": {"Labels": {"io.omnigent.podman-provider": "true"}},
+            "State": {"Running": False},
+        }])
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1000"}):
+            with patch("omnigent.community.sandbox.podman.launcher.shutil.which",
+                       side_effect=lambda name: f"/usr/bin/{name}"):
+                launcher = PodmanSandboxLauncher(
+                    config=PodmanConfig(image="test", systemd_scope=True)
+                )
+                run.side_effect = [completed([], stdout=inspect), completed([])]
+                launcher.resume("container-id")
+        start = run.call_args_list[1].args[0]
+        self.assertEqual(start[0], "/usr/bin/systemd-run")
+        self.assertEqual(start[7:9], ["podman", "start"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.shutil.which",
+           side_effect=lambda name: "/usr/bin/podman" if name == "podman" else None)
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_prepare_rejects_systemd_scope_without_systemd_run(self, run, _which):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(image="test", systemd_scope=True)
+        )
+        run.side_effect = [completed([], stdout="true")]
+        with self.assertRaisesRegex(click.ClickException, "requires the systemd-run CLI"):
+            launcher.prepare()
+
     def test_agent_workspace_requires_a_root_and_no_orphan_options(self):
         with self.assertRaisesRegex(ValidationError, "requires agent_workspace_root"):
             PodmanConfig(image="test", agent_workspace=True)

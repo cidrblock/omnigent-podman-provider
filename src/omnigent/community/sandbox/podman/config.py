@@ -237,6 +237,11 @@ class PodmanConfig(BaseModel):
     agent_workspace_state: list[str] = Field(default_factory=list)
     keys: list[KeyringKey] = Field(default_factory=list)
     bootstrap_command: str | None = Field(default=None, min_length=1)
+    #: Start containers inside a transient systemd scope, so ``conmon`` does not
+    #: join the cgroup of the unit that runs the server. Without it, stopping
+    #: that unit also signals conmon and the sandbox loses its network while the
+    #: container still reports "Up". Opt-in: it needs a systemd user manager.
+    systemd_scope: bool = False
 
     @field_validator("env")
     @classmethod

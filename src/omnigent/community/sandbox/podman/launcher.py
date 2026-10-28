@@ -329,12 +329,22 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         )
 
     def _podman(
-        self, *args: str, input: str | None = None, timeout: int | None = 30
+        self,
+        *args: str,
+        input: str | None = None,
+        timeout: int | None = 30,
+        scope: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run Podman without exposing command contents in its argv or errors."""
+        """Run Podman without exposing command contents in its argv or errors.
+
+        When *scope* is set, run it inside a transient systemd scope: ``conmon``
+        inherits the cgroup of the process that starts a container, and without a
+        scope that is the server's own unit, where a stop signals conmon too.
+        """
+        prefix = self._scope_prefix(scope) if scope is not None else []
         try:
             return subprocess.run(
-                [self.config.binary, *args],
+                [*prefix, self.config.binary, *args],
                 input=input,
                 capture_output=True,
                 text=True,
@@ -351,6 +361,26 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             raise click.ClickException(
                 f"Podman command could not run: {exc.strerror or type(exc).__name__}"
             ) from None
+
+    def _scope_prefix(self, unit: str) -> list[str]:
+        """Return the argv prefix that runs a command in its own transient scope.
+
+        ``conmon`` is spawned by the start of a container and inherits that
+        command's cgroup. Without a scope that is the server's own systemd unit,
+        so stopping the unit signals conmon as well: conmon ignores SIGTERM by
+        design, and the sandbox is left with only ``lo`` and no route while the
+        container still reports "Up". A transient scope moves conmon (and pasta
+        below it) out of the unit's cgroup, which is what makes a restart
+        survivable without special kill settings.
+        """
+        if not self.config.systemd_scope:
+            return []
+        systemd_run = shutil.which("systemd-run")
+        if systemd_run is None or not os.environ.get("XDG_RUNTIME_DIR"):
+            # Not every host running rootless Podman has a systemd user manager
+            # (a macOS Podman machine, a plain shell); start in-process there.
+            return []
+        return [systemd_run, "--user", "--scope", "--collect", "--quiet", "--unit", unit]
 
     def _secrets(self) -> list[str]:
         """Values that must never reach a user-facing error message."""
@@ -422,6 +452,11 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             raise self._failed("Podman is unavailable; check the local user or Podman machine", info)
         if self.config.require_rootless and info.stdout.strip().lower() != "true":
             raise click.ClickException("Podman is not running rootless; use a rootless user or Podman machine")
+        if self.config.systemd_scope and shutil.which("systemd-run") is None:
+            raise click.ClickException(
+                "systemd_scope requires the systemd-run CLI; install systemd or set "
+                "systemd_scope: false"
+            )
         image = self._podman("image", "exists", self.config.image)
         if image.returncode:
             raise self._failed(f"Podman image is unavailable: {self.config.image}", image)
@@ -543,7 +578,7 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         container_id = created.stdout.strip()
         if not container_id:
             raise click.ClickException("Podman returned no container ID")
-        started = self._podman("start", container_id, timeout=120)
+        started = self._podman("start", container_id, timeout=120, scope=container_name)
         if started.returncode:
             self._podman("rm", "--force", container_id)
             raise self._failed("Podman could not start the managed sandbox", started)
@@ -671,7 +706,7 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         if state is None:
             raise SandboxGoneError("Managed Podman sandbox no longer exists")
         if not state:
-            started = self._podman("start", sandbox_id, timeout=120)
+            started = self._podman("start", sandbox_id, timeout=120, scope=f"omni-resume-{sandbox_id[:12]}")
             if started.returncode:
                 raise self._failed("Podman could not resume the managed sandbox", started)
         self._reapply_egress_fence(sandbox_id)
