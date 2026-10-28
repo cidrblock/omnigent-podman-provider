@@ -164,6 +164,54 @@ A working sandbox does real work through the proxy: `pip download`, `npm view`,
 `gh api user`, `git ls-remote https://…` and the agent's own model calls all
 traverse it.
 
+## 6. Tell the agent what it may reach
+
+An agent that discovers the policy by failing wastes turns and may invent a
+workaround. Derive a read-only view of the allowlist from the proxy config, so
+the two cannot drift, and hand it to the sandbox:
+
+```bash
+#!/usr/bin/env bash
+# Render `acl allowed_sites ...` from squid.conf into a plain hostname list.
+awk '
+    /^[[:space:]]*acl[[:space:]]+allowed_sites[[:space:]]/ { collecting = 1 }
+    collecting {
+        line = $0; sub(/#.*/, "", line); gsub(/\\/, " ", line)
+        n = split(line, w, /[[:space:]]+/)
+        for (i = 1; i <= n; i++)
+            if (w[i] != "" && w[i] != "acl" && w[i] != "allowed_sites" && w[i] != "dstdomain") print w[i]
+    }
+    collecting && $0 !~ /\\[[:space:]]*$/ { collecting = 0 }
+' "${SQUID_CONF:-$HOME/.config/squid/squid.conf}" | sort -u > "$HOME/.omnigent/sandbox/egress-allowlist.txt"
+```
+
+Re-run it whenever `squid.conf` changes — a systemd path unit on
+`PathChanged=%h/.config/squid/squid.conf` is enough — and mount the output
+read-only:
+
+```yaml
+mounts:
+  - source: /home/USER/.omnigent/sandbox/egress-allowlist.txt
+    target: /etc/sandbox-egress/allowlist
+    mode: ro
+    relabel: z
+```
+
+Then say so in the agent's instructions (an `AGENTS.md` mounted into the
+workspace works well), because the file is only useful if the agent reads it
+*first*:
+
+- the list is the whole internet it has; matching is by domain suffix
+- `403` from the proxy = policy denial, do not retry; `407` = credential fault,
+  not a permission; a refusal in ~30 ms = the tool bypassed `HTTPS_PROXY`
+- if a task needs a host that is not listed, ask the operator to add it rather
+  than routing around the policy
+- exhaust in-policy sources first: the upstream repo (including docs sources and
+  changelogs), the package page on PyPI/npm, and the forge API
+
+Do not mount the proxy's access log for this. It contains every session's
+destinations and byte counts; policy is shareable, traffic history is not.
+
 ## Adding a destination
 
 One `dstdomain` line plus `systemctl --user restart squid-egress`. The fence
