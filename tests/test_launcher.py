@@ -152,10 +152,151 @@ class PodmanLauncherTests(unittest.TestCase):
             volumes = [create[index + 1] for index, item in enumerate(create) if item == "--volume"]
             self.assertEqual(volumes, [
                 f"{skills}:/root/.agents/skills/live:ro,z",
-                f"{scratch / 'omni-session-aabbccdd'}:/root/scratch:rw,Z",
+                f"{scratch / 'session'}:/root/scratch:rw,Z",
             ])
-            self.assertTrue((scratch / "omni-session-aabbccdd").is_dir())
-            self.assertEqual((scratch / "omni-session-aabbccdd").stat().st_mode & 0o777, 0o700)
+            self.assertTrue((scratch / "session").is_dir())
+            self.assertEqual((scratch / "session").stat().st_mode & 0o777, 0o700)
+
+            # A re-provision of the same sandbox reuses the directory its
+            # predecessor made instead of failing or starting empty.
+            (scratch / "session" / "kept.txt").write_text("work\n")
+            run.side_effect = [completed([], stdout="container-id"), completed([]), completed([])]
+            self.assertEqual(launcher.provision("session"), "container-id")
+            self.assertEqual((scratch / "session" / "kept.txt").read_text(), "work\n")
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_agent_workspace_is_private_per_sandbox_and_labelled(self, run):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "agent_work"
+            root.mkdir()
+            launcher = PodmanSandboxLauncher(
+                config=PodmanConfig(image="test", agent_workspace=True, agent_workspace_root=root)
+            )
+            run.side_effect = [completed([], stdout="container-id"), completed([]), completed([])]
+            launcher.provision("managed-a8bb739d")
+            create = run.call_args_list[0].args[0]
+            volumes = [create[index + 1] for index, item in enumerate(create) if item == "--volume"]
+            self.assertEqual(volumes, [f"{root / 'managed-a8bb739d'}:/root/agent_work:rw,z"])
+            labels = [create[index + 1] for index, item in enumerate(create) if item == "--label"]
+            workspace = root / "managed-a8bb739d"
+            self.assertIn(f"io.omnigent.agent-workspace={workspace}", labels)
+            self.assertEqual(workspace.stat().st_mode & 0o777, 0o700)
+
+            # A second sandbox gets its own directory, not the first one.
+            run.side_effect = [completed([], stdout="container-id"), completed([]), completed([])]
+            launcher.provision("managed-c4fffd6e")
+            create = run.call_args_list[3].args[0]
+            volumes = [create[index + 1] for index, item in enumerate(create) if item == "--volume"]
+            self.assertEqual(volumes, [f"{root / 'managed-c4fffd6e'}:/root/agent_work:rw,z"])
+
+            # Re-provisioning the same sandbox (a resume after the container
+            # died) finds the files its predecessor left behind.
+            (workspace / "notes.md").write_text("keep\n")
+            run.side_effect = [completed([], stdout="container-id"), completed([]), completed([])]
+            launcher.provision("managed-a8bb739d")
+            self.assertEqual((workspace / "notes.md").read_text(), "keep\n")
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_agent_workspace_is_absent_unless_enabled(self, run):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(image="test", mounts=[{"source": "/tmp", "target": "/root/scratch"}])
+        )
+        run.side_effect = [completed([], stdout="container-id"), completed([]), completed([])]
+        launcher.provision("session")
+        create = run.call_args_list[0].args[0]
+        self.assertEqual(
+            [create[index + 1] for index, item in enumerate(create) if item == "--volume"],
+            ["/tmp:/root/scratch:ro"],
+        )
+        self.assertFalse(
+            any("io.omnigent.agent-workspace" in str(item) for item in create)
+        )
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_agent_workspace_carries_opted_in_runner_state(self, run):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = PodmanSandboxLauncher(config=PodmanConfig(
+                image="test", agent_workspace=True, agent_workspace_root=root,
+                agent_workspace_state=["/root/.local/share/goose", "/root/.local/state/goose"],
+            ))
+            run.side_effect = [completed([], stdout="container-id"), completed([]), completed([])]
+            launcher.provision("session")
+            create = run.call_args_list[0].args[0]
+            volumes = [create[index + 1] for index, item in enumerate(create) if item == "--volume"]
+            self.assertEqual(volumes, [
+                f"{root / 'session'}:/root/agent_work:rw,z",
+                f"{root / 'session/state/root/.local/share/goose'}:/root/.local/share/goose:rw,z",
+                f"{root / 'session/state/root/.local/state/goose'}:/root/.local/state/goose:rw,z",
+            ])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_terminate_keeps_the_workspace(self, run):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = PodmanSandboxLauncher(
+                config=PodmanConfig(image="test", agent_workspace=True, agent_workspace_root=root)
+            )
+            run.side_effect = [completed([], stdout="container-id"), completed([]), completed([])]
+            launcher.provision("managed-a8bb739d")
+            workspace = root / "managed-a8bb739d"
+            (workspace / "report.md").write_text("findings\n")
+            inspect = json.dumps([{
+                "Config": {"Labels": {
+                    "io.omnigent.podman-provider": "true",
+                    "io.omnigent.podman-profile": launcher.provider,
+                }},
+                "State": {"Running": False},
+            }])
+            run.side_effect = [completed([], stdout=inspect), completed([])]
+            launcher.terminate("container-id")
+            self.assertEqual((workspace / "report.md").read_text(), "findings\n")
+
+    def test_agent_workspace_requires_a_root_and_no_orphan_options(self):
+        with self.assertRaisesRegex(ValidationError, "requires agent_workspace_root"):
+            PodmanConfig(image="test", agent_workspace=True)
+        for option in ({"agent_workspace_root": Path("/tmp/agent_work")},
+                       {"agent_workspace_target": "/root/work"},
+                       {"agent_workspace_state": ["/root/.local/share/goose"]}):
+            with self.subTest(option=option), self.assertRaisesRegex(
+                ValidationError, "require agent_workspace: true"
+            ):
+                PodmanConfig(image="test", **option)
+
+    def test_agent_workspace_refuses_the_container_home(self):
+        with self.assertRaisesRegex(ValidationError, "hides the image's own"):
+            PodmanConfig(image="test", agent_workspace=True,
+                         agent_workspace_root=Path("/tmp/agent_work"),
+                         agent_workspace_target="/root")
+        with self.assertRaisesRegex(ValidationError, "must be an absolute path"):
+            PodmanConfig(image="test", agent_workspace=True,
+                         agent_workspace_root=Path("/tmp/agent_work"),
+                         agent_workspace_target="agent_work")
+
+    def test_agent_workspace_rejects_state_inside_the_workspace_or_a_mount(self):
+        base = {"image": "test", "agent_workspace": True,
+                "agent_workspace_root": Path("/tmp/agent_work")}
+        with self.assertRaisesRegex(ValidationError, "cannot be inside agent_workspace_target"):
+            PodmanConfig(**base, agent_workspace_state=["/root/agent_work/cache"])
+        with self.assertRaisesRegex(ValidationError, "overlaps a mount target"):
+            PodmanConfig(**base, mounts=[{"source": "/tmp/x", "target": "/root/.local"}],
+                         agent_workspace_state=["/root/.local/share/goose"])
+        with self.assertRaisesRegex(ValidationError, "overlaps a mount target"):
+            PodmanConfig(**base, mounts=[{"source": "/tmp/x", "target": "/srv/work"}],
+                         agent_workspace_target="/srv")
+        with self.assertRaisesRegex(ValidationError, "must be an absolute path"):
+            PodmanConfig(**base, agent_workspace_state=["relative/state"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.shutil.which", return_value="/usr/bin/podman")
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_prepare_rejects_a_missing_workspace_root(self, run, _which):
+        launcher = PodmanSandboxLauncher(config=PodmanConfig(
+            image="test", agent_workspace=True,
+            agent_workspace_root=Path("/nonexistent-agent-workspace-root"),
+        ))
+        run.side_effect = [completed([], stdout="true"), completed([])]
+        with self.assertRaisesRegex(click.ClickException, "workspace root must be an existing"):
+            launcher.prepare()
 
     @patch("omnigent.community.sandbox.podman.launcher.shutil.which", return_value="/usr/bin/podman")
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")

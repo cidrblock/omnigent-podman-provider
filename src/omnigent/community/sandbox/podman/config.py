@@ -222,6 +222,19 @@ class PodmanConfig(BaseModel):
     require_rootless: bool = True
     startup_timeout_s: int = Field(default=60, ge=1, le=300)
     mounts: list[BindMount] = Field(default_factory=list)
+    #: Give each sandbox its own writable directory under ``agent_workspace_root``
+    #: and mount it at ``agent_workspace_target``, so concurrent sandboxes never
+    #: see each other's scratch work. The directory is named after the sandbox
+    #: and outlives it, so a resumed or re-provisioned sandbox finds its files.
+    agent_workspace: bool = False
+    agent_workspace_root: Path | None = None
+    #: ``None`` means ``{runtime_home}/agent_work``.
+    agent_workspace_target: str | None = None
+    #: Container paths copied *into* the per-sandbox workspace, under ``state/``,
+    #: and mounted back at the same path: the opt-in that lets a harness keep its
+    #: own state (e.g. ``/root/.local/share/goose``) without assuming every
+    #: deployment uses that harness.
+    agent_workspace_state: list[str] = Field(default_factory=list)
     keys: list[KeyringKey] = Field(default_factory=list)
     bootstrap_command: str | None = Field(default=None, min_length=1)
 
@@ -245,6 +258,69 @@ class PodmanConfig(BaseModel):
         ):
             raise ValueError("mount targets must be distinct and non-overlapping")
         return mounts
+
+    @property
+    def agent_workspace_container_target(self) -> str:
+        """Return the container path the per-sandbox workspace is mounted at."""
+        return self.agent_workspace_target or f"{self.runtime_home.rstrip('/')}/agent_work"
+
+    @model_validator(mode="after")
+    def validate_agent_workspace(self) -> "PodmanConfig":
+        """Keep the workspace off the container home and clear of other mounts."""
+        if not self.agent_workspace:
+            if (
+                self.agent_workspace_root is not None
+                or self.agent_workspace_target is not None
+                or self.agent_workspace_state
+            ):
+                raise ValueError(
+                    "agent_workspace_root, agent_workspace_target, and agent_workspace_state "
+                    "require agent_workspace: true"
+                )
+            return self
+        root = self.agent_workspace_root
+        if root is None:
+            raise ValueError("agent_workspace: true requires agent_workspace_root")
+        if not root.is_absolute() or ".." in root.parts:
+            raise ValueError("agent_workspace_root must be an absolute directory without '..'")
+        if any(character in str(root) for character in ":\r\n\x00"):
+            raise ValueError("agent_workspace_root cannot contain colon or control characters")
+        target = PurePosixPath(self.agent_workspace_container_target)
+        if not target.is_absolute() or ".." in target.parts or str(target) == "/":
+            raise ValueError("agent_workspace_target must be an absolute path without '..'")
+        home = PurePosixPath(self.runtime_home)
+        if target == home or target in home.parents:
+            # The image keeps harness binaries in $HOME (e.g. /root/.local/bin
+            # holds the kiro CLIs), so a bind mount there would hide them. Say
+            # so, rather than letting the sandbox fail in a confusing way later.
+            raise ValueError(
+                f"agent_workspace_target cannot be the container home ({home}) or one of its "
+                "parents: mounting the workspace there hides the image's own $HOME content"
+            )
+        occupied = [(PurePosixPath(mount.target), "a mount target") for mount in self.mounts]
+        self._reject_overlap(target, "agent_workspace_target", occupied)
+        for entry in self.agent_workspace_state:
+            state = PurePosixPath(entry)
+            if not state.is_absolute() or ".." in state.parts or str(state) == "/":
+                raise ValueError(
+                    f"agent_workspace_state entry must be an absolute path without '..': {entry!r}"
+                )
+            if state == target or target in state.parents:
+                raise ValueError(
+                    f"agent_workspace_state entry cannot be inside agent_workspace_target: {entry!r}"
+                )
+            self._reject_overlap(state, f"agent_workspace_state entry {entry!r}", occupied)
+            occupied.append((state, "an agent_workspace_state entry"))
+        return self
+
+    @staticmethod
+    def _reject_overlap(
+        candidate: PurePosixPath, label: str, occupied: list[tuple[PurePosixPath, str]]
+    ) -> None:
+        """Refuse a path that would nest inside, or hide, another mount."""
+        for other, description in occupied:
+            if candidate == other or candidate in other.parents or other in candidate.parents:
+                raise ValueError(f"{label} overlaps {description}: {other}")
 
     @model_validator(mode="after")
     def validate_keys(self) -> "PodmanConfig":

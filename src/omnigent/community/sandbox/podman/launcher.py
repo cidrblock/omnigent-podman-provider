@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 from contextlib import closing
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import click
 import keyring
@@ -42,6 +42,9 @@ EGRESS_RULESET_ANNOTATION = "omnigent-egress-ruleset"
 
 _MANAGED_LABEL = "io.omnigent.podman-provider"
 _PROFILE_LABEL = "io.omnigent.podman-profile"
+#: Host path of the sandbox's private workspace, so a later prune can map a
+#: leftover directory back to the sandbox that used it.
+_WORKSPACE_LABEL = "io.omnigent.agent-workspace"
 
 #: Upper bound on the Podman output quoted back in a user-facing error. Enough
 #: to identify the failing path or capability, short enough to stay readable in
@@ -135,6 +138,22 @@ def _unsearchable_entry(source: Path) -> str | None:
             # missing source, so treat this as unreadable rather than crashing.
             return str(directory)
     return None
+
+
+def _private_directory(path: Path) -> None:
+    """Create a mode-0700 directory, tolerating one an earlier sandbox left.
+
+    Per-sandbox directories are keyed on the sandbox name rather than the
+    container name, so the second launch of a sandbox finds the directory its
+    predecessor created and must reuse it rather than fail or start empty.
+    """
+    try:
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path.chmod(0o700)
+    except OSError as exc:
+        raise click.ClickException(
+            f"Podman agent workspace directory is unusable: {path}: {exc.strerror or exc}"
+        ) from None
 
 
 def _secret_service_items(bus: object, collection_label: str | None) -> list[object]:
@@ -412,6 +431,17 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
                 raise self._failed(
                     f"Podman network is unavailable: {self.config.network}", network
                 )
+        if self.config.agent_workspace:
+            root = self.config.agent_workspace_root
+            assert root is not None  # validated by PodmanConfig
+            if not root.is_dir():
+                raise click.ClickException(
+                    f"Podman agent workspace root must be an existing directory: {root}"
+                )
+            if not os.access(root, os.R_OK | os.X_OK):
+                raise click.ClickException(
+                    f"Podman agent workspace root is not accessible to this user: {root}"
+                )
         for mount in self.config.mounts:
             # A file source mounts one file (Podman creates the target path and
             # its parents); a directory source is the usual case.
@@ -429,11 +459,52 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
                 )
         self._keys()
 
+    def _workspace_directory(self, safe_name: str) -> Path | None:
+        """Create and return this sandbox's private workspace, if configured.
+
+        Keyed on the sandbox name, which the server keeps stable across a
+        re-provision (the wake path reuses the host id), so a resumed sandbox
+        finds the directory its predecessor created.
+        """
+        if not self.config.agent_workspace:
+            return None
+        root = self.config.agent_workspace_root
+        assert root is not None  # validated by PodmanConfig
+        workspace = root / safe_name
+        _private_directory(workspace)
+        return workspace
+
+    def _mount_specs(self, safe_name: str, workspace: Path | None) -> list[tuple[str, str, str]]:
+        """Return every ``--volume`` as ``(source, target, options)``.
+
+        The private workspace comes first, then the runner state it carries, then
+        the operator's own mounts. Two sandboxes for the same name would share the
+        workspace on purpose: the name, not the container, identifies the session.
+        """
+        specs: list[tuple[str, str, str]] = []
+        if workspace is not None:
+            specs.append((str(workspace), self.config.agent_workspace_container_target, "rw,z"))
+            for container_path in self.config.agent_workspace_state:
+                # Mirror the container path under ``state/`` so the host side is
+                # self-describing: state/root/.local/share/goose.
+                state = workspace / "state" / PurePosixPath(container_path).relative_to("/")
+                _private_directory(state)
+                specs.append((str(state), container_path, "rw,z"))
+        for mount in self.config.mounts:
+            source = mount.source
+            if mount.per_session:
+                source = source / safe_name
+                _private_directory(source)
+            options = mount.mode + (f",{mount.relabel}" if mount.relabel else "")
+            specs.append((str(source), mount.target, options))
+        return specs
+
     def provision(self, name: str) -> str:
         """Create a stopped container and boot its long-lived placeholder PID 1."""
         self._keys()
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-.")[:48] or "session"
         container_name = f"omni-{safe_name}-{secrets.token_hex(4)}"
+        workspace = self._workspace_directory(safe_name)
         args = [
             "create", "--name", container_name,
             "--label", f"{_MANAGED_LABEL}=true",
@@ -441,6 +512,8 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             "--label", f"io.omnigent.session-name={safe_name}",
             "--network", self.config.network,
         ]
+        if workspace is not None:
+            args.extend(["--label", f"{_WORKSPACE_LABEL}={workspace}"])
         # The fence is installed by an exec after the container is up, so the
         # process that runs nft needs NET_ADMIN. The sandbox therefore keeps
         # that capability for its lifetime: the fence is an accident guardrail
@@ -459,14 +532,8 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         args.extend(option for key in self.config.env if key in os.environ for option in ("--env", key))
         for key, value in self.config.resolved_environment.items():
             args.extend(["--env", f"{key}={value}"])
-        for mount in self.config.mounts:
-            source = mount.source
-            if mount.per_session:
-                source = source / container_name
-                source.mkdir(mode=0o700)
-                source.chmod(0o700)
-            options = mount.mode + (f",{mount.relabel}" if mount.relabel else "")
-            args.extend(["--volume", f"{source}:{mount.target}:{options}"])
+        for source, target, options in self._mount_specs(safe_name, workspace):
+            args.extend(["--volume", f"{source}:{target}:{options}"])
         if self.config.entrypoint:
             args.extend(["--entrypoint", self.config.entrypoint])
         args.extend([self.config.image, "/bin/sh", "-lc", "exec sleep infinity"])

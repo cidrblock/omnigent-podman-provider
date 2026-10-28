@@ -21,7 +21,7 @@ but has **not** been tested.
 | Lifecycle | create, exec, detached host start, stop, resume (same container, writable layer retained), removal, per-session profile aliases |
 | Networking | any Podman network value, including `pasta:<options>` and `slirp4netns:<options>` passed through verbatim; `deny_cidrs` for an in-sandbox egress fence |
 | Isolation | `annotations` (OCI-hook gating), `cap_add`/`cap_drop` (allowlisted), `runtime_user`/`runtime_home` for an unprivileged harness tree |
-| Filesystem | directory **or single-file** bind mounts, read-only or read-write, SELinux `z`/`Z` relabel, `per_session` scratch directories |
+| Filesystem | directory **or single-file** bind mounts, read-only or read-write, SELinux `z`/`Z` relabel, `per_session` scratch directories, per-sandbox `agent_workspace` |
 | Credentials | `env:` name passthrough, `environment:` literals, `keys:` from the Secret Service keyring (three lookup shapes), automatic runner env passthrough |
 | Images | one image per provider alias; no image changes required by the provider itself |
 
@@ -121,8 +121,45 @@ mounts:
   container then cannot read the path, and the host directory keeps that private
   label afterwards (`restorecon` reports it as customized).
 - `per_session: true` (rw only, directories only) creates a mode-0700 host
-  subdirectory per container under `source`; it survives session teardown.
+  subdirectory named after the **sandbox** under `source`; it survives session
+  teardown. Keying on the sandbox name rather than the container name is what
+  lets a re-provisioned sandbox (a resume after the container died) find the
+  directory its predecessor created instead of starting empty.
 - Sources that are symlinks and overlapping targets are rejected.
+
+### Per-sandbox workspace
+
+A shared directory lets concurrent sandboxes see each other's scratch work, which
+confuses agents and blurs their context. `agent_workspace` gives each sandbox its
+own directory instead:
+
+```yaml
+agent_workspace: true
+agent_workspace_root: /home/USER/agent_work
+# agent_workspace_target: /root/agent_work        # default: {runtime_home}/agent_work
+# agent_workspace_state:                          # opt-in: harness state, not implied
+#   - /root/.local/share/goose
+#   - /root/.local/state/goose
+```
+
+- The directory is `<agent_workspace_root>/<sandbox-name>`, created mode 0700 and
+  mounted writable with the `z` label. Two sandboxes never share one, and the
+  directory **outlives the container**: death, stop/start, and resume all return
+  to the same files. The container carries
+  `io.omnigent.agent-workspace=<host path>` so a later prune can map a leftover
+  directory back to the sandbox that used it.
+- `agent_workspace_state` is deliberately empty by default and by design: those
+  paths are mirrored under `<workspace>/state/` and mounted back at the same
+  container path, so a harness can keep its own session state across a
+  re-provision **without the provider assuming which harness you run**. A goose
+  profile opts in to goose's paths; a profile running something else opts into
+  its own, or into nothing.
+- The target may not be the container home or one of its parents. An image keeps
+  harness binaries under `$HOME` (e.g. `/root/.local/bin`), and a bind mount
+  there would hide them behind the empty workspace.
+- Use `relabel: z` semantics only — this is not a `mounts` entry, so `Z` (which
+  leaves a container-private MCS label on the host directory) is never applied,
+  because it would lock a re-provisioned sandbox out of its own old workspace.
 
 ### Credentials
 
