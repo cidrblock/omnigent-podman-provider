@@ -48,6 +48,10 @@ podman run --rm --annotation apply-firewall=true \
    ``FENCE_ALLOW_V4`` / ``FENCE_DENY_V4`` / ``FENCE_DENY_V6`` (set in the hook's
    ``env``), which is what the standalone example uses.
 
+The rendered ruleset is port-scoped where possible — the proxy on one port, the
+resolver on 53 — so the hook applies a policy that names destinations *and*
+the ports they are reachable on.
+
 The hook reads the file itself and pipes it: nft runs in the ``iptables_t``
 SELinux domain and cannot open user state files. It fails closed when the file
 is missing, empty, or unreadable, and re-checks that the table exists after

@@ -654,6 +654,7 @@ class PodmanLauncherTests(unittest.TestCase):
             image="example",
             network="pasta:--map-host-loopback=169.254.170.2",
             egress=[
+                {"allow": "169.254.170.2", "ports": [6767], "protocols": ["tcp"]},
                 {"deny": "192.168.0.0/16"},
                 {"allow": "192.168.1.50/32"},
                 {"allow": "0.0.0.0/0"},
@@ -662,15 +663,65 @@ class PodmanLauncherTests(unittest.TestCase):
         lines = config.render_egress_ruleset().splitlines()
         control = next(i for i, ln in enumerate(lines) if "control plane" in ln)
         operator = next(i for i, ln in enumerate(lines) if "operator policy" in ln)
-        bridge = next(i for i, ln in enumerate(lines) if "169.254.170.2" in ln)
+        bridge = next(i for i, ln in enumerate(lines) if "169.254.170.2/32" in ln)
         deny = next(i for i, ln in enumerate(lines) if "192.168.0.0/16" in ln)
         hole = next(i for i, ln in enumerate(lines) if "192.168.1.50/32" in ln)
         allow_any = next(i for i, ln in enumerate(lines) if "0.0.0.0/0" in ln)
         # control plane precedes operator rules; operator order is preserved
-        self.assertLess(control, bridge)
-        self.assertLess(bridge, operator)
+        self.assertLess(control, operator)
+        self.assertLess(operator, bridge)
         self.assertLess(deny, hole)
         self.assertLess(hole, allow_any)
+
+    def test_egress_control_plane_scopes_dns_to_port_53(self):
+        config = PodmanConfig(image="example", network="pasta", egress=[{"deny": "10.0.0.0/8"}])
+        ruleset = config.render_egress_ruleset()
+        # Resolution only: a blanket allow on the resolver address would let the
+        # sandbox reach whatever else the host offers on 169.254.1.1.
+        self.assertNotIn("ip daddr 169.254.1.1 accept", ruleset)
+        self.assertIn("ip daddr 169.254.1.1 meta l4proto udp th dport 53 accept", ruleset)
+        self.assertIn("ip daddr 169.254.1.1 meta l4proto tcp th dport 53 accept", ruleset)
+
+    def test_egress_narrows_an_entry_to_its_ports_and_protocols(self):
+        config = PodmanConfig(
+            image="example",
+            network="pasta",
+            egress=[
+                {"allow": "169.254.170.53", "ports": [3128, 8080], "protocols": ["tcp"]},
+            ],
+        )
+        ruleset = config.render_egress_ruleset()
+        self.assertIn(
+            "ip daddr 169.254.170.53/32 meta l4proto tcp th dport { 3128, 8080 } accept",
+            ruleset,
+        )
+        self.assertNotIn("udp th dport { 3128", ruleset)
+        # the address must not also be reachable on other ports
+        self.assertNotIn("ip daddr 169.254.170.53/32 accept", ruleset)
+
+    def test_egress_rejects_a_mapped_host_address_it_cannot_narrow(self):
+        with self.assertRaisesRegex(ValidationError, "host-loopback address"):
+            PodmanConfig(
+                image="example",
+                network="pasta:--map-host-loopback=169.254.170.2",
+                egress=[{"deny": "10.0.0.0/8"}],
+            )
+
+    def test_egress_validates_port_values(self):
+        with self.assertRaisesRegex(ValidationError, "invalid ports"):
+            PodmanConfig(
+                image="example", network="pasta", egress=[{"allow": "10.0.0.1", "ports": [0]}]
+            )
+        with self.assertRaisesRegex(ValidationError, "empty ports"):
+            PodmanConfig(
+                image="example", network="pasta", egress=[{"allow": "10.0.0.1", "ports": []}]
+            )
+        self.assertEqual(
+            PodmanConfig(
+                image="example", network="pasta", egress=[{"allow": "10.0.0.1", "ports": [443, 80, 443]}]
+            ).egress[0].ports,
+            [80, 443],
+        )
 
     def test_egress_always_ends_with_a_default_deny(self):
         config = PodmanConfig(
@@ -693,8 +744,8 @@ class PodmanLauncherTests(unittest.TestCase):
             image="example", network="pasta", egress=[{"deny": "fd00::/8"}, {"allow": "::/0"}]
         )
         ruleset = config.render_egress_ruleset()
-        self.assertIn("ip6 daddr fd00::/8 reject", ruleset)
-        self.assertIn("ip6 daddr ::/0 accept", ruleset)
+        self.assertIn("ip6 daddr fd00::/8 meta l4proto tcp reject", ruleset)
+        self.assertIn("ip6 daddr ::/0 meta l4proto tcp accept", ruleset)
 
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
     def test_provision_passes_the_ruleset_to_the_hook_by_annotation(self, run):
@@ -703,7 +754,10 @@ class PodmanLauncherTests(unittest.TestCase):
                 image="example",
                 network="pasta:--map-host-loopback=169.254.170.2",
                 annotations={"apply-firewall": "true"},
-                egress=[{"deny": "10.0.0.0/8"}, {"allow": "0.0.0.0/0"}],
+                egress=[
+                    {"allow": "169.254.170.2", "ports": [6767], "protocols": ["tcp"]},
+                    {"deny": "10.0.0.0/8"},
+                ],
             )
         )
         run.side_effect = [
@@ -738,7 +792,7 @@ class PodmanLauncherTests(unittest.TestCase):
         nsenter = run.call_args_list[3].args[0]
         self.assertEqual(nsenter[:6], ["podman", "unshare", "nsenter", "-n", "-t", "4242"])
         self.assertEqual(nsenter[-3:], ["nft", "-f", "-"])
-        self.assertIn("10.0.0.0/8 reject", run.call_args_list[3].kwargs["input"])
+        self.assertIn("10.0.0.0/8 meta l4proto tcp reject", run.call_args_list[3].kwargs["input"])
 
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
     def test_resume_fails_closed_when_the_fence_cannot_be_applied(self, run):
@@ -770,7 +824,7 @@ class PodmanLauncherTests(unittest.TestCase):
             # label and would apply an empty ruleset while exiting 0.
             self.assertTrue(str(path).startswith(runtime_dir))
             self.assertEqual(oct(path.stat().st_mode)[-3:], "600")
-            self.assertIn("10.0.0.0/8 reject", path.read_text())
+            self.assertIn("10.0.0.0/8 meta l4proto tcp reject", path.read_text())
 
     def test_no_fence_or_capability_change_without_deny_cidrs(self):
         launcher = PodmanSandboxLauncher(

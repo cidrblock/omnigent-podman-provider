@@ -128,12 +128,28 @@ class EgressRule(BaseModel):
     ``allow`` placed above a broader ``deny`` punches a hole, and one placed
     below it is dead code. Values are validated as addresses/prefixes; nothing
     else can reach the generated ruleset.
+
+    ``ports`` narrows the entry to specific destination ports, which is what
+    makes an egress policy small enough to reason about — allow one proxy on
+    one port rather than a whole address::
+
+        egress:
+          - allow: 169.254.170.53      # the sandbox's only route out
+            ports: [3128]
+          - allow: 169.254.170.2       # Omnigent bridge + tool relay
+            ports: [6767, 8765]
+            protocols: [tcp]
+
+    Without ``ports`` the entry covers every port on the address, which is
+    almost never what a fence wants.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     allow: str | None = None
     deny: str | None = None
+    ports: list[int] | None = None
+    protocols: list[Literal["tcp", "udp"]] | None = None
 
     @model_validator(mode="after")
     def validate_entry(self) -> "EgressRule":
@@ -147,7 +163,29 @@ class EgressRule(BaseModel):
             raise ValueError(
                 f"egress entry must be an IP address or CIDR, got {value!r}"
             ) from None
+        if self.ports is not None:
+            if not self.ports:
+                raise ValueError(f"egress entry {value!r} has an empty ports list")
+            invalid = [port for port in self.ports if not 1 <= port <= 65535]
+            if invalid:
+                raise ValueError(f"egress entry {value!r} has invalid ports {invalid}")
+            self.ports = sorted(set(self.ports))
+        if self.protocols is not None and not self.protocols:
+            raise ValueError(f"egress entry {value!r} has an empty protocols list")
         return self
+
+    @property
+    def port_match(self) -> str:
+        """The nft match fragment for this entry's ports, or an empty string."""
+        if not self.ports:
+            return ""
+        rendered = "{ " + ", ".join(str(port) for port in self.ports) + " }"
+        return f" th dport {rendered}"
+
+    @property
+    def protocol_list(self) -> list[str]:
+        """Protocols to emit, one rule each (both when unspecified)."""
+        return list(self.protocols or ("tcp", "udp"))
 
     @property
     def network(self) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
@@ -312,8 +350,15 @@ class PodmanConfig(BaseModel):
 
         Control-plane destinations are prepended and are not operator-editable,
         because losing them breaks the sandbox itself rather than the policy:
-        loopback, the pasta DNS resolver, and every host-loopback mapping
-        declared in ``network`` (the Omnigent bridge).
+        loopback and the pasta DNS resolver, both port-scoped (DNS is UDP/TCP
+        53 only, not "whatever 169.254.1.1 offers").
+
+        Host-loopback mappings declared in ``network`` are deliberately *not*
+        auto-allowed: the provider cannot know which ports they serve, and
+        allowing the address outright would open every port on the host's
+        loopback. The operator lists them in ``egress`` with ``ports``, and
+        configuration is rejected if a mapped address is left uncovered —
+        silently widening the fence is worse than a startup error.
 
         The operator's entries follow in their authored order, so first-match
         semantics let them punch a hole in a broader deny. A final
@@ -334,20 +379,56 @@ class PodmanConfig(BaseModel):
             'add rule inet omnigent_fence out oifname "lo" accept',
             "add rule inet omnigent_fence out ip daddr 127.0.0.0/8 accept",
             "add rule inet omnigent_fence out ip6 daddr ::1 accept",
-            "add rule inet omnigent_fence out ip daddr 169.254.1.1 accept",
+            # pasta's DNS forwarder, resolution only — never general traffic.
+            'add rule inet omnigent_fence out ip daddr 169.254.1.1 '
+            "meta l4proto udp th dport 53 accept",
+            'add rule inet omnigent_fence out ip daddr 169.254.1.1 '
+            "meta l4proto tcp th dport 53 accept",
         ]
-        for address in self.host_loopback_addresses:
-            lines.append(f"add rule inet omnigent_fence out ip daddr {address} accept")
         lines.append("# operator policy")
         for rule in self.egress:
             family = "ip" if rule.network.version == 4 else "ip6"
-            lines.append(
-                f"add rule inet omnigent_fence out {family} daddr {rule.network} {rule.action}"
-            )
+            for protocol in rule.protocol_list:
+                lines.append(
+                    f"add rule inet omnigent_fence out {family} daddr {rule.network}"
+                    f" meta l4proto {protocol}{rule.port_match} {rule.action}"
+                )
         lines.append(
             'add rule inet omnigent_fence out counter reject comment "omnigent: default deny"'
         )
         return "\n".join(lines) + "\n"
+
+    @model_validator(mode="after")
+    def validate_egress_covers_control_plane(self) -> "PodmanConfig":
+        """Require an explicit ``egress`` entry for every mapped host address.
+
+        The provider cannot infer which ports a host-loopback mapping serves,
+        and a blanket allow would open every port on the host's loopback. So an
+        ``egress`` profile must state it, with ``ports`` if it wants a narrow
+        rule; the failure is at configuration time rather than a sandbox that
+        starts and then cannot reach its control plane.
+        """
+        if self.egress is None:
+            return self
+        covered = {
+            entry.network.network_address
+            for entry in self.egress
+            if entry.allow is not None and entry.ports
+        }
+        uncovered = [
+            address
+            for address in self.host_loopback_addresses
+            if ipaddress.ip_address(address) not in covered
+        ]
+        if uncovered:
+            formatted = ", ".join(
+                f"- allow: {address}\n    ports: [<port>]" for address in uncovered
+            )
+            raise ValueError(
+                "egress must list each host-loopback address from network: with the "
+                "ports it serves, otherwise the fence cannot narrow them:\n" + formatted
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_fence_network(self) -> "PodmanConfig":

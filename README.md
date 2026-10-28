@@ -213,6 +213,23 @@ The provider renders that into an nftables ruleset and:
   table is absent afterwards.
 - **re-applies it on resume** — see below.
 
+Entries take optional ``ports`` and ``protocols``, which is what makes a
+one-destination policy expressible — a proxy on a single port rather than a host
+reachable on all of them::
+
+    egress:
+      - allow: 169.254.170.2       # pasta maps this to host loopback
+        ports: [3128, 6767, 8765]  # egress proxy, Omnigent, tool relay
+        protocols: [tcp]
+
+The control plane is port-scoped too: pasta's resolver is allowed on UDP/TCP 53
+only, never as a blanket address. Host-loopback mappings named in ``network``
+are **not** auto-allowed, because the provider cannot know which ports they
+serve and a blanket rule would open every port on the host's loopback;
+configuration is rejected if such an address has no ``egress`` entry with
+``ports``, so the failure lands at startup instead of as a sandbox that cannot
+reach its own control plane.
+
 Older ``deny_cidrs`` still works: it installs the same shape of ruleset from a
 ``bootstrap_command`` inside the container, which needs ``cap_add: [NET_ADMIN]``
 for the sandbox's lifetime and is therefore only a fallback for environments
