@@ -16,7 +16,14 @@
 # The ruleset is piped to `nft -f -` rather than read from a file: nft runs in
 # the iptables_t SELinux domain and cannot read user state directories.
 #
-# Tuning (via the hook's "env" in the JSON, all optional):
+# Two modes:
+#   1. The container carries an ``omnigent-egress-ruleset`` annotation naming a
+#      host file (a provider that renders the policy writes one). That file is
+#      applied verbatim, piped on stdin, so the hook and the provider's
+#      resume-time re-apply cannot drift.
+#   2. No such annotation: fall back to the built-in defaults below.
+#
+# Tuning (mode 2, via the hook's "env" in the JSON, all optional):
 #   FENCE_ALLOW_V4  extra v4 destinations to allow (e.g. a host-loopback mapping)
 #   FENCE_ALLOW_V6  extra v6 destinations to allow
 #   FENCE_DENY_V4   v4 CIDRs to reject (default: RFC1918)
@@ -30,6 +37,43 @@ done
 if [ -z "$NFT" ]; then
     echo "egress-fence: nft not found on the host" >&2
     exit 1
+fi
+
+# The OCI state (stdin) may name a pre-rendered ruleset file to apply instead.
+# The state JSON escapes "/" as "\/", so the extracted path is unescaped before
+# use — the OCI runtime is not required to emit an unescaped form.
+STATE_JSON=$(cat)
+RULESET_FILE=$(printf '%s' "$STATE_JSON" | tr -d '\n' \
+    | sed -n 's/.*"omnigent-egress-ruleset"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | sed 's|\\/|/|g')
+
+if [ -n "$RULESET_FILE" ]; then
+    if [ ! -s "$RULESET_FILE" ]; then
+        echo "egress-fence: ruleset $RULESET_FILE is missing, empty, or unreadable" >&2
+        exit 1
+    fi
+    # Feed the ruleset through a variable, not a redirect: if the file cannot be
+    # read (SELinux label, permissions) nft would otherwise receive empty stdin
+    # and exit 0 — a silent no-fence.
+    RULESET_TEXT=$(cat "$RULESET_FILE") || {
+        echo "egress-fence: cannot read ruleset $RULESET_FILE" >&2
+        exit 1
+    }
+    if [ -z "$RULESET_TEXT" ]; then
+        echo "egress-fence: ruleset $RULESET_FILE is empty" >&2
+        exit 1
+    fi
+    OUTPUT=$(printf '%s\n' "$RULESET_TEXT" | "$NFT" -f - 2>&1)
+    if [ $? -ne 0 ]; then
+        echo "egress-fence: applying $RULESET_FILE failed: $OUTPUT" >&2
+        exit 1
+    fi
+    # Fail closed unless the table actually exists afterwards.
+    if ! "$NFT" list table inet omnigent_fence > /dev/null 2>&1; then
+        echo "egress-fence: ruleset $RULESET_FILE applied but the fence table is absent" >&2
+        exit 1
+    fi
+    exit 0
 fi
 
 ALLOW_V4=${FENCE_ALLOW_V4:-""}

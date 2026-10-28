@@ -6,6 +6,7 @@ rootless Podman and can use the host's configured Podman machine on macOS.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -15,8 +16,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import closing
+from pathlib import Path
 
 import click
 import keyring
@@ -31,6 +34,11 @@ from .config import PodmanConfig, is_passthrough_network
 
 
 _LOGGER = logging.getLogger(__name__)
+
+#: Annotation carrying the generated egress ruleset to the OCI hook, so the
+#: hook applies exactly the policy the provider rendered (and the same file is
+#: re-applied after a resume).
+EGRESS_RULESET_ANNOTATION = "omnigent-egress-ruleset"
 
 _MANAGED_LABEL = "io.omnigent.podman-provider"
 _PROFILE_LABEL = "io.omnigent.podman-profile"
@@ -130,6 +138,39 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         self.config = config
         self.provider = config.provider_id
         self._key_values: dict[str, str] | None = None
+
+    def egress_ruleset_path(self) -> Path | None:
+        """Write the rendered egress policy to a cache file and return its path.
+
+        The OCI hook runs in the host mount namespace, so the ruleset must live
+        on the host. It is written under ``$XDG_RUNTIME_DIR`` (per-user tmpfs,
+        gone at logout) rather than ``~/.cache`` so a shutdown cannot leave a
+        stale policy behind, and the hook pipes its contents into ``nft -f -``
+        — nft runs in the ``iptables_t`` SELinux domain and cannot open user
+        state files itself.
+
+        The file is content-addressed and mode 0600; it is also what
+        :meth:`resume` re-applies, so the hook and the resume path cannot drift.
+
+        :returns: Path to the ruleset, or ``None`` when no ``egress`` policy is set.
+        """
+        ruleset = self.config.render_egress_ruleset()
+        if ruleset is None:
+            return None
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        cache_root = Path(runtime_dir)
+        if not cache_root.is_dir():
+            cache_root = Path(tempfile.gettempdir())
+        cache_root = cache_root / "omnigent-podman-provider"
+        digest = hashlib.sha256(ruleset.encode("utf-8")).hexdigest()[:16]
+        path = cache_root / f"egress-{digest}.nft"
+        if not path.exists():
+            cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            temporary = path.with_suffix(f".tmp{os.getpid()}")
+            temporary.write_text(ruleset, encoding="utf-8")
+            temporary.chmod(0o600)
+            os.replace(temporary, path)
+        return path
 
     def _keys(self) -> dict[str, str]:
         """Read each requested credential without exporting it on the host."""
@@ -239,6 +280,9 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             args.extend(["--cap-drop", capability])
         for name, value in self.config.annotations.items():
             args.extend(["--annotation", f"{name}={value}"])
+        ruleset = self.egress_ruleset_path()
+        if ruleset is not None:
+            args.extend(["--annotation", f"{EGRESS_RULESET_ANNOTATION}={ruleset}"])
         args.extend(option for key in self.config.env if key in os.environ for option in ("--env", key))
         for key, value in self.config.resolved_environment.items():
             args.extend(["--env", f"{key}={value}"])
@@ -370,12 +414,48 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         return self._owned_state(sandbox_id) is True
 
     def resume(self, sandbox_id: str) -> None:
-        """Start a stopped container without discarding its writable layer."""
+        """Start a stopped container without discarding its writable layer.
+
+        Starting a container **recreates its network namespace** when the old one
+        is gone (a host reboot), while the OCI hook only runs at creation — so an
+        ``egress`` profile re-applies its ruleset here. Idempotent: the ruleset
+        flushes and rebuilds the table, so a still-live netns is fine too.
+        """
         state = self._owned_state(sandbox_id)
         if state is None:
             raise SandboxGoneError("Managed Podman sandbox no longer exists")
         if not state and self._podman("start", sandbox_id, timeout=120).returncode:
             raise click.ClickException("Podman could not resume the managed sandbox")
+        self._reapply_egress_fence(sandbox_id)
+
+    def _reapply_egress_fence(self, sandbox_id: str) -> None:
+        """Re-apply the profile's egress ruleset inside the container netns.
+
+        Runs the host's ``nft`` through ``podman unshare nsenter`` so no
+        capability is required inside the container. Fail closed: a container
+        must not come back with the policy missing.
+
+        :param sandbox_id: Running container to fence.
+        :raises click.ClickException: When the ruleset cannot be applied.
+        """
+        ruleset = self.egress_ruleset_path()
+        if ruleset is None:
+            return
+        inspected = self._podman("inspect", "--format", "{{.State.Pid}}", sandbox_id)
+        pid = inspected.stdout.strip() if inspected.returncode == 0 else ""
+        if not pid or pid == "0":
+            raise click.ClickException(
+                f"Cannot re-apply the egress fence: {sandbox_id} has no running pid"
+            )
+        applied = self._podman(
+            "unshare", "nsenter", "-n", "-t", pid, "--", "nft", "-f", "-",
+            input=ruleset.read_text(encoding="utf-8"),
+        )
+        if applied.returncode:
+            raise click.ClickException(
+                "Cannot re-apply the egress fence to the resumed sandbox; refusing to "
+                "start it unfenced"
+            )
 
     def terminate(self, sandbox_id: str) -> None:
         """Remove an owned container; an already-removed container is fine."""

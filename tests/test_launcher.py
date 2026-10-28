@@ -1,7 +1,7 @@
 """Contract tests for the managed Podman lifecycle and secret-safe exec path."""
 
-import os
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -648,6 +648,129 @@ class PodmanLauncherTests(unittest.TestCase):
         patcher, _ = self._fake_secretstorage("Agents", [])
         with patcher, self.assertRaisesRegex(ValueError, "no keyring item labelled"):
             _keyring_description_password("foo", "Agents")
+
+    def test_egress_renders_ordered_policy_with_control_plane_first(self):
+        config = PodmanConfig(
+            image="example",
+            network="pasta:--map-host-loopback=169.254.170.2",
+            egress=[
+                {"deny": "192.168.0.0/16"},
+                {"allow": "192.168.1.50/32"},
+                {"allow": "0.0.0.0/0"},
+            ],
+        )
+        lines = config.render_egress_ruleset().splitlines()
+        control = next(i for i, ln in enumerate(lines) if "control plane" in ln)
+        operator = next(i for i, ln in enumerate(lines) if "operator policy" in ln)
+        bridge = next(i for i, ln in enumerate(lines) if "169.254.170.2" in ln)
+        deny = next(i for i, ln in enumerate(lines) if "192.168.0.0/16" in ln)
+        hole = next(i for i, ln in enumerate(lines) if "192.168.1.50/32" in ln)
+        allow_any = next(i for i, ln in enumerate(lines) if "0.0.0.0/0" in ln)
+        # control plane precedes operator rules; operator order is preserved
+        self.assertLess(control, bridge)
+        self.assertLess(bridge, operator)
+        self.assertLess(deny, hole)
+        self.assertLess(hole, allow_any)
+
+    def test_egress_always_ends_with_a_default_deny(self):
+        config = PodmanConfig(
+            image="example", network="pasta", egress=[{"deny": "10.0.0.0/8"}]
+        )
+        last = config.render_egress_ruleset().strip().splitlines()[-1]
+        self.assertIn("counter reject", last)
+        self.assertIn("omnigent: default deny", last)
+
+    def test_egress_rejects_bad_entries_and_unsafe_networks(self):
+        with self.assertRaisesRegex(ValidationError, "must be an IP address or CIDR"):
+            PodmanConfig(image="example", network="pasta", egress=[{"deny": "192.168.0.0/16 ; rm -rf /"}])
+        with self.assertRaisesRegex(ValidationError, "exactly one of"):
+            PodmanConfig(image="example", network="pasta", egress=[{"allow": "10.0.0.0/8", "deny": "10.0.0.0/8"}])
+        with self.assertRaisesRegex(ValidationError, "requires network"):
+            PodmanConfig(image="example", network="host", egress=[{"deny": "10.0.0.0/8"}])
+
+    def test_egress_accepts_ipv6_entries(self):
+        config = PodmanConfig(
+            image="example", network="pasta", egress=[{"deny": "fd00::/8"}, {"allow": "::/0"}]
+        )
+        ruleset = config.render_egress_ruleset()
+        self.assertIn("ip6 daddr fd00::/8 reject", ruleset)
+        self.assertIn("ip6 daddr ::/0 accept", ruleset)
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_provision_passes_the_ruleset_to_the_hook_by_annotation(self, run):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(
+                image="example",
+                network="pasta:--map-host-loopback=169.254.170.2",
+                annotations={"apply-firewall": "true"},
+                egress=[{"deny": "10.0.0.0/8"}, {"allow": "0.0.0.0/0"}],
+            )
+        )
+        run.side_effect = [
+            completed([], stdout="container-id"), completed([]), completed([], stdout="sleep")
+        ]
+        with tempfile.TemporaryDirectory() as cache:
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": cache}):
+                launcher.provision("session")
+        create = run.call_args_list[0].args[0]
+        annotations = [create[i + 1] for i, a in enumerate(create) if a == "--annotation"]
+        self.assertIn("apply-firewall=true", annotations)
+        ruleset_annotations = [a for a in annotations if a.startswith("omnigent-egress-ruleset=")]
+        self.assertEqual(len(ruleset_annotations), 1)
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_resume_reapplies_the_fence_inside_the_container_netns(self, run):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(
+                image="example", network="pasta", egress=[{"deny": "10.0.0.0/8"}]
+            )
+        )
+        run.side_effect = [
+            completed([], stdout=json.dumps([{"Config": {"Labels": {"io.omnigent.podman-provider": "true"}},
+                                              "State": {"Running": False}}])),  # _owned_state
+            completed([]),                                                    # start
+            completed([], stdout="4242"),                                     # inspect pid
+            completed([]),                                                    # nsenter nft
+        ]
+        with tempfile.TemporaryDirectory() as cache:
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": cache}):
+                launcher.resume("container-id")
+        nsenter = run.call_args_list[3].args[0]
+        self.assertEqual(nsenter[:6], ["podman", "unshare", "nsenter", "-n", "-t", "4242"])
+        self.assertEqual(nsenter[-3:], ["nft", "-f", "-"])
+        self.assertIn("10.0.0.0/8 reject", run.call_args_list[3].kwargs["input"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_resume_fails_closed_when_the_fence_cannot_be_applied(self, run):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(
+                image="example", network="pasta", egress=[{"deny": "10.0.0.0/8"}]
+            )
+        )
+        run.side_effect = [
+            completed([], stdout=json.dumps([{"Config": {"Labels": {"io.omnigent.podman-provider": "true"}},
+                                              "State": {"Running": False}}])),
+            completed([]),
+            completed([], stdout="4242"),
+            completed([], code=1),
+        ]
+        with tempfile.TemporaryDirectory() as cache:
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": cache}):
+                with self.assertRaisesRegex(click.ClickException, "refusing to start it unfenced"):
+                    launcher.resume("container-id")
+
+    def test_ruleset_is_written_where_the_hook_can_read_it(self):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(image="example", network="pasta", egress=[{"deny": "10.0.0.0/8"}])
+        )
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime_dir}):
+                path = launcher.egress_ruleset_path()
+            # Not under ~/.cache (cache_home_t): the OCI hook cannot read that
+            # label and would apply an empty ruleset while exiting 0.
+            self.assertTrue(str(path).startswith(runtime_dir))
+            self.assertEqual(oct(path.stat().st_mode)[-3:], "600")
+            self.assertIn("10.0.0.0/8 reject", path.read_text())
 
     def test_no_fence_or_capability_change_without_deny_cidrs(self):
         launcher = PodmanSandboxLauncher(

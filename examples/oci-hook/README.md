@@ -38,6 +38,22 @@ podman run --rm --annotation apply-firewall=true \
   --cap-drop=NET_ADMIN --cap-drop=NET_RAW <image> <cmd>
 ```
 
+## Two ways to supply the ruleset
+
+1. **Annotation (used with the provider).** The container carries
+   ``omnigent-egress-ruleset=/path/to/ruleset.nft`` and the hook pipes that file
+   into ``nft -f -``. The provider renders the file from the profile's
+   ``egress:`` policy, which keeps hook, re-apply, and config in sync.
+2. **Built-in defaults.** No annotation: the hook builds a ruleset from
+   ``FENCE_ALLOW_V4`` / ``FENCE_DENY_V4`` / ``FENCE_DENY_V6`` (set in the hook's
+   ``env``), which is what the standalone example uses.
+
+The hook reads the file itself and pipes it: nft runs in the ``iptables_t``
+SELinux domain and cannot open user state files. It fails closed when the file
+is missing, empty, or unreadable, and re-checks that the table exists after
+applying — otherwise a failed read would hand nft an empty stdin, which exits 0
+and leaves the container silently unfenced.
+
 ## Why `createContainer`
 
 Measured on Podman 5.8.4 / crun 1.28:

@@ -168,6 +168,56 @@ name, and every `env:` name, merged after any explicit value you set. You never
 have to maintain that list by hand, and secret values still never appear on the
 `podman create` command line — only names.
 
+### Ordered egress policy
+
+``egress`` is an ordered list of ``allow``/``deny`` entries, each an IP address
+or CIDR. nftables is first-match, so order is precedence — an ``allow`` above a
+broader ``deny`` is a deliberate hole; one below it is dead code::
+
+    sandbox:
+      server_url: http://169.254.170.2:6767
+      providers:
+        - provider: podman
+          podman:
+            image: localhost/omnigent-host:latest
+            network: pasta:--map-host-loopback=169.254.170.2
+            egress:
+              - deny: 192.168.0.0/16
+              - deny: 10.0.0.0/8
+              - deny: 172.16.0.0/12
+              - deny: 100.64.0.0/10        # CGNAT
+              - deny: 224.0.0.0/4          # multicast
+              - deny: fe80::/10
+              - deny: fd00::/8
+              - allow: 0.0.0.0/0           # explicit opt-in to the internet
+              - allow: ::/0
+
+The provider renders that into an nftables ruleset and:
+
+- **prepends the control plane** — loopback, the pasta DNS resolver
+  (``169.254.1.1``) and every host-loopback mapping named in ``network``. Those
+  are not operator-editable: losing them breaks the sandbox rather than the
+  policy.
+- **appends a default deny** —
+  ``counter reject comment "omnigent: default deny"``. With no ``allow:
+  0.0.0.0/0`` the sandbox has no unlisted egress; with one, the appended rule is
+  unreachable and its counter reads zero, which is the confirmation that the
+  operator opted in. Nothing falls back to "internet open" by accident.
+- **requires its own network namespace** — ``egress`` is rejected with
+  ``network: host`` (rootless host networking joins the per-user rootless
+  namespace, where a rule would fence every container, not this one).
+- **writes the ruleset to ``$XDG_RUNTIME_DIR``** and passes its path to the OCI
+  hook through the ``omnigent-egress-ruleset`` annotation. The hook pipes the
+  contents into ``nft -f -`` (nft itself cannot open user state files under
+  ``iptables_t``) and fails closed if the file is unreadable, empty, or the
+  table is absent afterwards.
+- **re-applies it on resume** — see below.
+
+Older ``deny_cidrs`` still works: it installs the same shape of ruleset from a
+``bootstrap_command`` inside the container, which needs ``cap_add: [NET_ADMIN]``
+for the sandbox's lifetime and is therefore only a fallback for environments
+without OCI hooks.
+
 ### Aliases: several images or postures
 
 Each selectable sandbox needs its own registered provider id, matching
@@ -234,8 +284,12 @@ which needs no privileges inside the container at all.
   until something starts them.
 - **Sandbox lifetime**: nothing in this provider expires a container.
 - **Egress fence lifetime**: a stop/start keeps the container's network namespace,
-  so OCI-hook rules survive it; a **host reboot** recreates the namespace and the
-  rules must be re-applied (`podman unshare nsenter -n -t <pid> -- nft -f -`).
+  so the hook's rules survive it. A **host reboot** recreates the namespace and
+  the OCI hook does not run again (hooks fire at creation only; adding
+  ``poststart`` does not change that), so an ``egress`` profile re-applies its
+  ruleset in ``resume()`` — the only path that starts a container after a
+  reboot. That re-apply is fail-closed: a container that cannot be fenced is not
+  started.
 - **Secret hygiene**: values provided through `env:` do appear in the container
   environment, so do not share `podman inspect` output for credential-bearing
   containers. `keys:` avoids that for the entries it resolves.
