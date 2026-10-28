@@ -191,11 +191,19 @@ read-only:
 
 ```yaml
 mounts:
-  - source: /home/USER/.omnigent/sandbox/egress-allowlist.txt
-    target: /etc/sandbox-egress/allowlist
+  # mount the DIRECTORY, not the file: a single-file bind mount pins the inode,
+  # so a regenerated list is invisible to an already-running sandbox (measured:
+  # the container kept the old content, and with :Z the file mount was not even
+  # readable). A directory mount follows the rename immediately.
+  - source: /home/USER/.omnigent/sandbox/egress
+    target: /etc/sandbox-egress
     mode: ro
     relabel: z
 ```
+
+Verified end to end: editing `squid.conf` on the host changed
+`/etc/sandbox-egress/allowlist` inside a *running* sandbox within seconds, and
+reverting it removed the entry again.
 
 Then say so in the agent's instructions (an `AGENTS.md` mounted into the
 workspace works well), because the file is only useful if the agent reads it
