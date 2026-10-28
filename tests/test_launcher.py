@@ -308,6 +308,57 @@ class PodmanLauncherTests(unittest.TestCase):
             self.launcher.provision("session")
         self.assertEqual(run.call_args_list[2].args[0], ["podman", "rm", "--force", "container-id"])
 
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_start_failure_reports_podman_stderr(self, run):
+        """crun's reason is dropped today, so every launch fails identically."""
+        run.side_effect = [
+            completed([], stdout="container-id"),
+            completed([], code=125, stderr=(
+                'Error: unable to start container "abc": '
+                "open /srv/skills/stray: permission denied\n"
+            )),
+            completed([]),
+        ]
+        with self.assertRaises(click.ClickException) as failure:
+            self.launcher.provision("session")
+        message = str(failure.exception)
+        self.assertIn("could not start the managed sandbox", message)
+        self.assertIn("open /srv/skills/stray: permission denied", message)
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_create_failure_reports_podman_stderr(self, run):
+        run.side_effect = [completed([], code=125, stderr="Error: no such image localhost/x\n")]
+        with self.assertRaises(click.ClickException) as failure:
+            self.launcher.provision("session")
+        self.assertIn("could not create the managed sandbox", str(failure.exception))
+        self.assertIn("no such image localhost/x", str(failure.exception))
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    @patch("omnigent.community.sandbox.podman.launcher.keyring.get_password", return_value="host-secret-value")
+    def test_podman_detail_redacts_credential_values(self, _get_password, run):
+        """Podman echoes argv in some failures, and argv can carry a key."""
+        launcher = PodmanSandboxLauncher(config=PodmanConfig(
+            image="test", keys=[{"key_name": "app", "env_var": "APP_API_KEY"}],
+        ))
+        run.side_effect = [
+            completed([], stdout="container-id"),
+            completed([], code=125, stderr="Error: invalid value host-secret-value for --env\n"),
+            completed([]),
+        ]
+        with self.assertRaises(click.ClickException) as failure:
+            launcher.provision("session")
+        self.assertNotIn("host-secret-value", str(failure.exception))
+        self.assertIn("***", str(failure.exception))
+
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_empty_podman_stderr_keeps_the_plain_message(self, run):
+        run.side_effect = [completed([], stdout="container-id"), completed([], code=1), completed([])]
+        with self.assertRaises(click.ClickException) as failure:
+            self.launcher.provision("session")
+        self.assertEqual(
+            str(failure.exception), "Podman could not start the managed sandbox"
+        )
+
     @patch("omnigent.community.sandbox.podman.launcher.time.sleep")
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
     def test_provision_waits_for_guest_bootstrap(self, run, _sleep):
@@ -326,11 +377,35 @@ class PodmanLauncherTests(unittest.TestCase):
         launcher = PodmanSandboxLauncher(config=PodmanConfig(image="test", startup_timeout_s=1))
         run.side_effect = [
             completed([], stdout="container-id"), completed([]),
-            completed([], code=1), completed([]),
+            completed([], code=1),
+            completed([], stdout="exited exit 127\n"),
+            completed([], stderr="/usr/local/bin/guest-init: not found\n"),
+            completed([]),
         ]
         with self.assertRaisesRegex(click.ClickException, "bootstrap did not complete"):
             launcher.provision("session")
-        self.assertEqual(run.call_args_list[3].args[0], ["podman", "rm", "--force", "container-id"])
+        self.assertEqual(run.call_args_list[5].args[0], ["podman", "rm", "--force", "container-id"])
+
+    @patch("omnigent.community.sandbox.podman.launcher.time.sleep")
+    @patch("omnigent.community.sandbox.podman.launcher.time.monotonic", side_effect=[0, 0, 2])
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_bootstrap_timeout_reports_container_state_before_removal(self, run, _clock, _sleep):
+        """The container log is deleted with the container: read it first."""
+        launcher = PodmanSandboxLauncher(config=PodmanConfig(image="test", startup_timeout_s=1))
+        run.side_effect = [
+            completed([], stdout="container-id"), completed([]),
+            completed([], code=1),
+            completed([], stdout="exited exit 127\n"),
+            completed([], stderr="guest-init: config.yaml: no such file\n"),
+            completed([]),
+        ]
+        with self.assertRaises(click.ClickException) as failure:
+            launcher.provision("session")
+        message = str(failure.exception)
+        self.assertIn("state: exited exit 127", message)
+        self.assertIn("guest-init: config.yaml: no such file", message)
+        self.assertEqual(run.call_args_list[3].args[0][1:2], ["inspect"])
+        self.assertEqual(run.call_args_list[4].args[0][1:2], ["logs"])
 
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
     def test_terminate_refuses_unowned_container(self, run):
@@ -552,6 +627,48 @@ class PodmanLauncherTests(unittest.TestCase):
                 run.side_effect = [completed([], stdout="true"), completed([])]
                 launcher.prepare()  # must not reject a file source
             self.assertTrue(config.mounts[0].source.is_file())
+
+    @unittest.skipIf(os.geteuid() == 0, "root can traverse any directory")
+    def test_prepare_names_an_untraversable_mount_subdirectory(self):
+        """A 0700 directory owned by another user fails ``podman start`` with no
+        path in the launch error; prepare() reports it while the path is known."""
+        with tempfile.TemporaryDirectory() as directory:
+            skills = Path(directory) / "skills"
+            blocked = skills / "root-owned-skill"
+            blocked.mkdir(parents=True)
+            (blocked / "SKILL.md").write_text("body\n")
+            blocked.chmod(0o000)
+            config = PodmanConfig(
+                image="example", network="pasta",
+                mounts=[{"source": str(skills), "target": "/root/.agents/skills",
+                         "mode": "ro", "relabel": "z"}],
+            )
+            launcher = PodmanSandboxLauncher(config=config)
+            with patch("omnigent.community.sandbox.podman.launcher.subprocess.run") as run:
+                run.side_effect = [completed([], stdout="true"), completed([])]
+                with self.assertRaises(click.ClickException) as failure:
+                    launcher.prepare()
+            # Restore the mode before the temporary tree is removed.
+            blocked.chmod(0o700)
+        message = str(failure.exception)
+        self.assertIn("not fully accessible", message)
+        self.assertIn("root-owned-skill", message)
+        self.assertIn("uid", message)
+
+    def test_prepare_accepts_a_traversable_mount_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            skills = Path(directory) / "skills"
+            (skills / "demo").mkdir(parents=True)
+            (skills / "demo" / "SKILL.md").write_text("body\n")
+            config = PodmanConfig(
+                image="example", network="pasta",
+                mounts=[{"source": str(skills), "target": "/root/.agents/skills",
+                         "mode": "ro", "relabel": "z"}],
+            )
+            launcher = PodmanSandboxLauncher(config=config)
+            with patch("omnigent.community.sandbox.podman.launcher.subprocess.run") as run:
+                run.side_effect = [completed([], stdout="true"), completed([])]
+                launcher.prepare()
 
     def test_per_session_mount_must_be_a_directory(self):
         with tempfile.TemporaryDirectory() as directory:

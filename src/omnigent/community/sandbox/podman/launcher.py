@@ -43,6 +43,99 @@ EGRESS_RULESET_ANNOTATION = "omnigent-egress-ruleset"
 _MANAGED_LABEL = "io.omnigent.podman-provider"
 _PROFILE_LABEL = "io.omnigent.podman-profile"
 
+#: Upper bound on the Podman output quoted back in a user-facing error. Enough
+#: to identify the failing path or capability, short enough to stay readable in
+#: the session banner.
+_MAX_DETAIL_CHARS = 500
+
+
+def _redact(text: str, secrets_to_hide: list[str]) -> str:
+    """Remove known credential values from Podman output.
+
+    Podman echoes parts of its own command line in some failures (an invalid
+    ``--env`` value, a bad volume spec), so the detail that makes an error
+    diagnosable is exactly the detail that can leak a secret. Every value the
+    provider injects is scrubbed before the text is returned.
+    """
+    for secret in secrets_to_hide:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+def _error_detail(
+    result: subprocess.CompletedProcess[str], secrets_to_hide: list[str]
+) -> str:
+    """Condense a failed Podman invocation's stderr into one diagnosable clause.
+
+    Podman prints its reason on the last stderr line and may precede it with
+    warnings; keeping the tail preserves the reason. Returns an empty string
+    when Podman said nothing, so callers can fall back to a plain message.
+    """
+    lines = [line.strip() for line in (result.stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    detail = _redact(" ".join(lines[-3:]), secrets_to_hide)
+    if len(detail) > _MAX_DETAIL_CHARS:
+        detail = detail[:_MAX_DETAIL_CHARS] + "…"
+    return detail
+
+
+#: How many directories ``prepare()`` inspects inside a mount source before it
+#: stops looking. Rootless crun opens the bind source tree, so an unsearchable
+#: directory below a readable one still fails the launch — but the scan must not
+#: walk a large ``agent_work`` tree on every launch.
+_MOUNT_SCAN_LIMIT = 1000
+
+
+def _unsearchable_entry(source: Path) -> str | None:
+    """Describe the first directory under ``source`` this user cannot traverse.
+
+    A mount source that *is* readable is not enough: with ``:z`` relabelling
+    Podman walks the tree, and rootless crun opens each directory it meets. A
+    directory owned by another user (a stray ``root:root`` 0700 entry created by
+    a tool run under ``sudo``) then fails the container start with nothing but
+    ``open <path>: permission denied`` on stderr — and the launch error the user
+    sees names no path at all.
+
+    Only directory *search* permission is checked, because that is what blocks
+    resolution; a file's own mode is irrelevant to a bind mount. Symlinks are
+    skipped: ``os.access`` follows them, so a dangling link inside a source
+    (harmless here) would otherwise report the whole mount as broken.
+
+    :param source: Bind-mount source validated as an existing path.
+    :returns: ``"<path> (mode 0o700, uid 0)"`` for the first bad directory, or
+        ``None`` when every directory is traversable.
+    """
+    if not source.is_dir():
+        return None
+    pending = [source]
+    seen = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > _MOUNT_SCAN_LIMIT:
+                        return None
+                    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if os.access(entry.path, os.X_OK):
+                        pending.append(Path(entry.path))
+                        continue
+                    try:
+                        mode = entry.stat(follow_symlinks=False).st_mode & 0o7777
+                        owner = entry.stat(follow_symlinks=False).st_uid
+                    except OSError:  # pragma: no cover - raced or unreadable parent
+                        return str(entry.path)
+                    return f"{entry.path} (mode 0o{mode:o}, uid {owner})"
+        except OSError:
+            # The source itself cannot be listed; prepare() already rejected a
+            # missing source, so treat this as unreadable rather than crashing.
+            return str(directory)
+    return None
+
 
 def _secret_service_items(bus: object, collection_label: str | None) -> list[object]:
     """Return the items of one Secret Service collection (or of every one).
@@ -229,8 +322,77 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
                 timeout=timeout,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise click.ClickException(f"Podman command could not complete ({type(exc).__name__})") from None
+        except subprocess.TimeoutExpired:
+            raise click.ClickException(
+                f"Podman command did not finish within {timeout}s"
+            ) from None
+        except OSError as exc:
+            # The reason (a missing binary, a permission error) is what makes
+            # this actionable, and it contains no command arguments.
+            raise click.ClickException(
+                f"Podman command could not run: {exc.strerror or type(exc).__name__}"
+            ) from None
+
+    def _secrets(self) -> list[str]:
+        """Values that must never reach a user-facing error message."""
+        values = [
+            value
+            for name, value in self.config.resolved_environment.items()
+            # The passthrough is a list of *names* derived from the config, not a
+            # secret, and redacting it would mangle any message quoting it.
+            if name != "OMNIGENT_RUNNER_ENV_PASSTHROUGH" and value
+        ]
+        try:
+            values.extend(self._keys().values())
+        except click.ClickException:
+            # A keyring miss is reported on its own path; the error we are
+            # building must not turn into a different failure.
+            pass
+        # Short values would redact unrelated words in Podman's output.
+        return [value for value in values if len(value) >= 6]
+
+    def _detail_suffix(self, result: subprocess.CompletedProcess[str]) -> str:
+        """Return ``": <reason>"`` for a failed call, or ``""`` if Podman was silent."""
+        detail = _error_detail(result, self._secrets())
+        return f": {detail}" if detail else ""
+
+    def _failed(
+        self, action: str, result: subprocess.CompletedProcess[str]
+    ) -> click.ClickException:
+        """Build an error that says what failed *and* why Podman failed.
+
+        Losing Podman's stderr turns every launch failure into the same
+        unsupported report ("Podman could not start the managed sandbox"), so
+        the reason is appended whenever Podman supplied one.
+        """
+        return click.ClickException(f"{action}{self._detail_suffix(result)}")
+
+    def _container_failure_detail(self, container_id: str) -> str:
+        """Best-effort reason a just-created container never became ready.
+
+        Reads the exit state and the tail of the container's own log, which is
+        where an entrypoint that crashed during bootstrap says why (the managed
+        host log path in the generic message is only written once the host
+        starts, so a failure before that leaves nothing else to go on).
+        """
+        parts: list[str] = []
+        state = self._podman(
+            "inspect", "--format", "{{.State.Status}} exit {{.State.ExitCode}}", container_id
+        )
+        if state.returncode == 0 and state.stdout.strip():
+            parts.append(f"state: {state.stdout.strip()}")
+        logs = self._podman("logs", "--tail", "20", container_id)
+        if logs.returncode == 0:
+            tail = [
+                line.strip()
+                for line in f"{logs.stdout}\n{logs.stderr}".splitlines()
+                if line.strip()
+            ]
+            if tail:
+                parts.append("last output: " + " | ".join(tail[-10:]))
+        return _redact(
+            "; ".join(parts)[:_MAX_DETAIL_CHARS], self._secrets()
+        )
 
     def prepare(self) -> None:
         """Check CLI access, local image, and any named network."""
@@ -238,21 +400,32 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             raise click.ClickException(f"Podman CLI not found: {self.config.binary}")
         info = self._podman("info", "--format", "{{.Host.Security.Rootless}}")
         if info.returncode:
-            raise click.ClickException("Podman is unavailable; check the local user or Podman machine")
+            raise self._failed("Podman is unavailable; check the local user or Podman machine", info)
         if self.config.require_rootless and info.stdout.strip().lower() != "true":
             raise click.ClickException("Podman is not running rootless; use a rootless user or Podman machine")
         image = self._podman("image", "exists", self.config.image)
         if image.returncode:
-            raise click.ClickException(f"Podman image is unavailable: {self.config.image}")
+            raise self._failed(f"Podman image is unavailable: {self.config.image}", image)
         if not is_passthrough_network(self.config.network):
-            if self._podman("network", "exists", self.config.network).returncode:
-                raise click.ClickException(f"Podman network is unavailable: {self.config.network}")
+            network = self._podman("network", "exists", self.config.network)
+            if network.returncode:
+                raise self._failed(
+                    f"Podman network is unavailable: {self.config.network}", network
+                )
         for mount in self.config.mounts:
             # A file source mounts one file (Podman creates the target path and
             # its parents); a directory source is the usual case.
             if not (mount.source.is_dir() or mount.source.is_file()) or mount.source.is_symlink():
                 raise click.ClickException(
                     f"Podman mount source must be an existing file or directory: {mount.source}"
+                )
+            # A readable source directory can still hold a directory the
+            # rootless userns cannot open, which crun only reports at start.
+            # Say so here, while the message can still name the path and owner.
+            unsearchable = _unsearchable_entry(mount.source)
+            if unsearchable is not None:
+                raise click.ClickException(
+                    f"Podman mount source is not fully accessible to this user: {unsearchable}"
                 )
         self._keys()
 
@@ -299,14 +472,14 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         args.extend([self.config.image, "/bin/sh", "-lc", "exec sleep infinity"])
         created = self._podman(*args, timeout=120)
         if created.returncode:
-            raise click.ClickException("Podman could not create the managed sandbox")
+            raise self._failed("Podman could not create the managed sandbox", created)
         container_id = created.stdout.strip()
         if not container_id:
             raise click.ClickException("Podman returned no container ID")
         started = self._podman("start", container_id, timeout=120)
         if started.returncode:
             self._podman("rm", "--force", container_id)
-            raise click.ClickException("Podman could not start the managed sandbox")
+            raise self._failed("Podman could not start the managed sandbox", started)
         deadline = time.monotonic() + self.config.startup_timeout_s
         # The image's entrypoint may first write credentials and Git settings.
         # The final `exec sleep infinity` marks bootstrap completion.
@@ -326,8 +499,13 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         except BaseException:
             self._podman("rm", "--force", container_id)
             raise
+        # The container is still here, so its state and own log still exist:
+        # read them before removing it, or the reason for a crashed entrypoint
+        # is deleted along with the container.
+        detail = self._container_failure_detail(container_id)
         self._podman("rm", "--force", container_id)
-        raise click.ClickException("Podman sandbox bootstrap did not complete")
+        suffix = f": {detail}" if detail else ""
+        raise click.ClickException(f"Podman sandbox bootstrap did not complete{suffix}")
 
     def _egress_fence_script(self) -> str:
         """Build the nft script that blocks ``deny_cidrs`` inside the sandbox.
@@ -388,6 +566,7 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         if check and completed.returncode:
             raise click.ClickException(
                 f"Podman sandbox command failed (exit {completed.returncode})"
+                f"{self._detail_suffix(result)}"
             )
         return completed
 
@@ -398,7 +577,7 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             exists = self._podman("container", "exists", sandbox_id)
             if exists.returncode == 1:
                 return None
-            raise click.ClickException("Podman could not inspect the managed sandbox")
+            raise self._failed("Podman could not inspect the managed sandbox", result)
         try:
             details = json.loads(result.stdout)[0]
             if details["Config"]["Labels"].get(_MANAGED_LABEL) != "true":
@@ -424,8 +603,10 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         state = self._owned_state(sandbox_id)
         if state is None:
             raise SandboxGoneError("Managed Podman sandbox no longer exists")
-        if not state and self._podman("start", sandbox_id, timeout=120).returncode:
-            raise click.ClickException("Podman could not resume the managed sandbox")
+        if not state:
+            started = self._podman("start", sandbox_id, timeout=120)
+            if started.returncode:
+                raise self._failed("Podman could not resume the managed sandbox", started)
         self._reapply_egress_fence(sandbox_id)
 
     def _reapply_egress_fence(self, sandbox_id: str) -> None:
@@ -446,6 +627,7 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         if not pid or pid == "0":
             raise click.ClickException(
                 f"Cannot re-apply the egress fence: {sandbox_id} has no running pid"
+                f"{self._detail_suffix(inspected)}"
             )
         applied = self._podman(
             "unshare", "nsenter", "-n", "-t", pid, "--", "nft", "-f", "-",
@@ -454,12 +636,13 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
         if applied.returncode:
             raise click.ClickException(
                 "Cannot re-apply the egress fence to the resumed sandbox; refusing to "
-                "start it unfenced"
+                f"start it unfenced{self._detail_suffix(applied)}"
             )
 
     def terminate(self, sandbox_id: str) -> None:
         """Remove an owned container; an already-removed container is fine."""
         if self._owned_state(sandbox_id) is None:
             return
-        if self._podman("rm", "--force", sandbox_id, timeout=120).returncode:
-            raise click.ClickException("Podman could not remove the managed sandbox")
+        removed = self._podman("rm", "--force", sandbox_id, timeout=120)
+        if removed.returncode:
+            raise self._failed("Podman could not remove the managed sandbox", removed)
