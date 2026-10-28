@@ -1,0 +1,8 @@
+# Mount read-only at /etc/gitconfig so a sandbox cannot lose it: entries here
+# are the system baseline, and a user ~/.gitconfig may be rewritten at runtime.
+[url "https://github.com/"]
+	insteadOf = git@github.com:
+	insteadOf = ssh://git@github.com/
+[credential]
+	# Token from the environment, so it never lands in a remote URL or .git/config.
+	helper = "!f() { test \\"$1\\" = get && echo username=x-access-token && echo password=$GH_TOKEN; }; f"

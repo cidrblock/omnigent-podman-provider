@@ -1,0 +1,20 @@
+# Rootless quadlet: keeps the proxy alive without root, and publishes it on
+# host loopback only. Sandboxes reach it through pasta's --map-host-loopback,
+# so it is never exposed on the LAN.
+[Unit]
+Description=Sandbox egress CONNECT proxy (squid)
+After=network-online.target
+
+[Container]
+ContainerName=squid-egress
+Image=docker.io/ubuntu/squid:latest
+PublishPort=127.0.0.1:3128:3128
+Volume=%h/.config/squid/squid.conf:/etc/squid/squid.conf:ro,Z
+Volume=%h/.config/squid/passwd:/etc/squid/passwd:ro,Z
+LogDriver=journald
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

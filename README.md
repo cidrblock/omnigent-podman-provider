@@ -235,6 +235,44 @@ Older ``deny_cidrs`` still works: it installs the same shape of ruleset from a
 for the sandbox's lifetime and is therefore only a fallback for environments
 without OCI hooks.
 
+### Putting an L7 proxy in front of the fence
+
+The fence is L3/L4: nftables cannot see TLS SNI, so a profile cannot express
+"GitHub and PyPI" as addresses — only "this address, this port". The narrow way
+to give a sandbox internet access is therefore **one address, one port**, with a
+CONNECT proxy behind it deciding which hostnames are reachable:
+
+```yaml
+network: pasta:--map-host-loopback=169.254.170.2,--ipv4-only
+egress:
+  - allow: 169.254.170.2
+    ports: [3128, 6767, 8765]      # proxy, server, tool relay
+    protocols: [tcp]
+environment:
+  NO_PROXY: 169.254.170.2          # the control plane must bypass the proxy
+keys:
+  - env_var: HTTPS_PROXY           # full proxy URL, from the secret store
+    keyring: Agents
+    description: squid-proxy
+```
+
+That replaces `allow: 0.0.0.0/0`, and because there is no longer a blanket allow,
+port 22, QUIC/UDP 443, `git://` and DoH all disappear without being enumerated.
+
+A tested, rootless Squid setup — quadlet unit, authenticated allowlist config,
+HTTPS-only gitconfig, verification commands and the limits of hostname-level
+policy — lives in [`examples/squid/`](examples/squid/README.md).
+
+Two things this design makes explicit:
+
+- **Authentication is not optional.** The proxy binds host loopback, which every
+  local process can reach, so an allowlist without `proxy_auth` is an open relay
+  for the whole machine.
+- **Hostname granularity is the ceiling.** The proxy sees `CONNECT host:443`,
+  not paths, so an allowlisted host remains an exfiltration surface and a broad
+  entry such as `.googleapis.com` is really an API surface — the credential's
+  scope is what narrows that.
+
 ### Aliases: several images or postures
 
 Each selectable sandbox needs its own registered provider id, matching
