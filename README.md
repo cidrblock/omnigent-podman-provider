@@ -1,13 +1,13 @@
 # Omnigent Podman provider
 
-A community sandbox provider for **Omnigent 0.19.x**: rootless Podman containers
+A community sandbox provider for **Omnigent 0.19.x–0.20.x**: rootless Podman containers
 as managed agent sandboxes, driven through the Podman CLI. Nothing in this
 repository changes a running Omnigent service by itself; installing the wheel only
 registers the provider.
 
 The [ai-development-sandbox Podman provider](https://github.com/djdanielsson/ai-development-sandbox/tree/main/podman-provider)
 informed the entry-point and managed-host design. This implementation targets the
-0.19.x contract, runs against the local Podman CLI rather than a Docker-compatible
+0.19.x–0.20.x contract, runs against the local Podman CLI rather than a Docker-compatible
 socket, and adds network isolation, credential plumbing, and unprivileged-runtime
 support described below.
 
@@ -29,8 +29,8 @@ Network isolation is the one area that needs a second component: an **OCI hook**
 fenced at container creation. See [`examples/oci-hook/`](examples/oci-hook/) — it
 documents the hook's requirements in full (stage choice, ruleset, install steps,
 lifetime, verification, limits). The in-provider `deny_cidrs` option is the
-alternative when an OCI hook is not an option; it is weaker, because the rules are
-installed from inside the container by a `bootstrap_command` and therefore need
+alternative when an OCI hook is not an option; it is weaker, because the provider
+installs the rules from inside the container at startup and therefore needs
 `cap_add: [NET_ADMIN]` for the sandbox's lifetime.
 
 ## Install
@@ -93,12 +93,12 @@ sandbox:
 | `mounts` | `[]` | Bind mounts; see below |
 | `annotations` | `{}` | OCI annotations (`--annotation NAME=VALUE`), e.g. `apply-firewall: "true"` |
 | `cap_add` | `[]` | Capabilities to add, allowlist: `NET_ADMIN`, `NET_RAW` |
-| `cap_drop` | `[]` | Capabilities to drop, same allowlist |
-| `deny_cidrs` | `[]` | IPv4 CIDRs blocked by an in-sandbox nft ruleset installed from `bootstrap_command`. Requires a `pasta`/`slirp4netns` network and adds `NET_ADMIN` |
+| `cap_drop` | `[]` | Capabilities to drop; any valid capability name, including `ALL` |
+| `deny_cidrs` | `[]` | IPv4 CIDRs blocked by an in-sandbox nft ruleset the provider installs at startup. Requires a `pasta`/`slirp4netns` network and adds `NET_ADMIN` |
 | `runtime_user` | `null` | When set, every exec runs as this unprivileged user — including the managed host Omnigent starts, and therefore the runners and harness under it. Privileged setup passes `as_root=True` internally |
 | `runtime_home` | `/root` | `$HOME` exported to those execs |
 | `entrypoint` | `null` | `--entrypoint` override; absent preserves the image's own init |
-| `bootstrap_command` | `null` | Shell command run once, as root, after the image init has finished and before Omnigent starts the host |
+| `bootstrap_command` | `null` | Shell command run once as the container's default user (root unless `runtime_user` is set), after the image init and before Omnigent starts the host |
 | `binary` | `podman` | Podman executable |
 | `require_rootless` | `true` | Refuse to use a rootful Podman |
 | `startup_timeout_s` | `60` | How long to wait for the image's placeholder process to take over PID 1 |
@@ -210,9 +210,9 @@ keys:
 - Values are exported into the provider's `podman exec` shells only — never into
   `podman create` arguments or the container's stored environment. They are
   visible in the environment of the launched process and its children.
-- `bootstrap_command` runs once as root with those exports available, so an image
-  whose init wants a secret in a private credential file can be served without
-  putting the secret in the container spec.
+- `bootstrap_command` runs once with those exports available (as root unless
+  `runtime_user` is set), so an image whose init wants a secret in a private
+  credential file can be served without putting the secret in the container spec.
 
 ### Runner environment passthrough is derived
 
@@ -253,10 +253,11 @@ broader ``deny`` is a deliberate hole; one below it is dead code::
 
 The provider renders that into an nftables ruleset and:
 
-- **prepends the control plane** — loopback, the pasta DNS resolver
-  (``169.254.1.1``) and every host-loopback mapping named in ``network``. Those
-  are not operator-editable: losing them breaks the sandbox rather than the
-  policy.
+- **prepends the control plane** — loopback and the pasta DNS resolver
+  (``169.254.1.1``, UDP/TCP 53 only). Those are not operator-editable: losing
+  them breaks the sandbox rather than the policy. Host-loopback mappings named
+  in ``network`` are **not** included; the operator allows them in ``egress``
+  with explicit ports.
 - **appends a default deny** —
   ``counter reject comment "omnigent: default deny"``. With no ``allow:
   0.0.0.0/0`` the sandbox has no unlisted egress; with one, the appended rule is
@@ -289,8 +290,8 @@ configuration is rejected if such an address has no ``egress`` entry with
 ``ports``, so the failure lands at startup instead of as a sandbox that cannot
 reach its own control plane.
 
-Older ``deny_cidrs`` still works: it installs the same shape of ruleset from a
-``bootstrap_command`` inside the container, which needs ``cap_add: [NET_ADMIN]``
+Older ``deny_cidrs`` still works: the provider installs the same shape of
+ruleset inside the container at startup, which needs ``cap_add: [NET_ADMIN]``
 for the sandbox's lifetime and is therefore only a fallback for environments
 without OCI hooks.
 
@@ -412,7 +413,7 @@ which needs no privileges inside the container at all.
 
 ## Development checks
 
-From a checkout, with Omnigent 0.19.x importable:
+From a checkout, with Omnigent 0.19.x or 0.20.x importable:
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
