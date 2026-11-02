@@ -325,6 +325,18 @@ class PodmanLauncherTests(unittest.TestCase):
         with self.assertRaisesRegex(click.ClickException, "requires the systemd-run CLI"):
             launcher.prepare()
 
+    @patch("omnigent.community.sandbox.podman.launcher.shutil.which",
+           side_effect=lambda name: "/usr/bin/podman" if name == "podman" else "/usr/bin/systemd-run")
+    @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
+    def test_prepare_rejects_systemd_scope_without_a_runtime_dir(self, run, _which):
+        launcher = PodmanSandboxLauncher(
+            config=PodmanConfig(image="test", systemd_scope=True)
+        )
+        run.side_effect = [completed([], stdout="true")]
+        with patch.dict(os.environ, {"XDG_RUNTIME_DIR": ""}):
+            with self.assertRaisesRegex(click.ClickException, "requires XDG_RUNTIME_DIR"):
+                launcher.prepare()
+
     def test_agent_workspace_requires_a_root_and_no_orphan_options(self):
         with self.assertRaisesRegex(ValidationError, "requires agent_workspace_root"):
             PodmanConfig(image="test", agent_workspace=True)
@@ -774,13 +786,15 @@ class PodmanLauncherTests(unittest.TestCase):
         config = PodmanConfig(image="example", annotations={"apply-firewall": "true"})
         self.assertEqual(config.annotations, {"apply-firewall": "true"})
 
-    def test_cap_drop_is_allowlisted(self):
-        with self.assertRaisesRegex(ValidationError, "cap_drop"):
-            PodmanConfig(image="example", cap_drop=["SYS_ADMIN"])
-        self.assertEqual(
-            PodmanConfig(image="example", cap_drop=["NET_ADMIN", "NET_RAW"]).cap_drop,
-            ["NET_ADMIN", "NET_RAW"],
-        )
+    def test_cap_drop_accepts_any_valid_capability(self):
+        for value in ("ALL", "SYS_ADMIN", "NET_ADMIN", "NET_RAW"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    PodmanConfig(image="example", cap_drop=[value]).cap_drop, [value]
+                )
+        for bad in ("net_admin", "SYS_ADMIN ", "--volume"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValidationError, "cap_drop"):
+                PodmanConfig(image="example", cap_drop=[bad])
 
     @patch("omnigent.community.sandbox.podman.launcher.subprocess.run")
     def test_annotations_and_cap_drop_reach_create(self, run):
@@ -1095,7 +1109,7 @@ class PodmanLauncherTests(unittest.TestCase):
             completed([], stdout="container-id"), completed([]), completed([], stdout="sleep")
         ]
         with tempfile.TemporaryDirectory() as cache:
-            with patch.dict(os.environ, {"XDG_CACHE_HOME": cache}):
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": cache}):
                 launcher.provision("session")
         create = run.call_args_list[0].args[0]
         annotations = [create[i + 1] for i, a in enumerate(create) if a == "--annotation"]
@@ -1118,7 +1132,7 @@ class PodmanLauncherTests(unittest.TestCase):
             completed([]),                                                    # nsenter nft
         ]
         with tempfile.TemporaryDirectory() as cache:
-            with patch.dict(os.environ, {"XDG_CACHE_HOME": cache}):
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": cache}):
                 launcher.resume("container-id")
         nsenter = run.call_args_list[3].args[0]
         self.assertEqual(nsenter[:6], ["podman", "unshare", "nsenter", "-n", "-t", "4242"])
@@ -1140,7 +1154,7 @@ class PodmanLauncherTests(unittest.TestCase):
             completed([], code=1),
         ]
         with tempfile.TemporaryDirectory() as cache:
-            with patch.dict(os.environ, {"XDG_CACHE_HOME": cache}):
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": cache}):
                 with self.assertRaisesRegex(click.ClickException, "refusing to start it unfenced"):
                     launcher.resume("container-id")
 

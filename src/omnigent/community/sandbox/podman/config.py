@@ -13,6 +13,9 @@ _IPV4_CIDR = re.compile(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?:/[0-9]{1,2})?\Z")
 #: Capabilities an operator may grant. Deliberately tiny: NET_ADMIN is what an
 #: entrypoint needs to install an egress fence, NET_RAW for diagnostic tooling.
 _ALLOWED_CAP_ADD = frozenset({"NET_ADMIN", "NET_RAW"})
+#: Dropping capabilities never weakens isolation, so any name Podman accepts is
+#: fine; the pattern keeps argv values to plain names (``ALL`` or ``NET_ADMIN``).
+_CAP_DROP_NAME = re.compile(r"(?:ALL|[A-Z][A-Z0-9_]*)\Z")
 #: Annotation names an operator may set. Podman passes these to the OCI spec,
 #: where hooks can gate on them (e.g. ``apply-firewall=true``).
 _ANNOTATION_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,126}\Z")
@@ -354,9 +357,9 @@ class PodmanConfig(BaseModel):
         """Dropping is always safe, so anything Podman accepts is allowed here."""
         if len(caps) != len(set(caps)):
             raise ValueError("cap_drop must be unique")
-        unknown = set(caps) - _ALLOWED_CAP_ADD
-        if unknown:
-            raise ValueError(f"cap_drop only accepts {sorted(_ALLOWED_CAP_ADD)}")
+        invalid = [name for name in caps if not _CAP_DROP_NAME.fullmatch(name)]
+        if invalid:
+            raise ValueError(f"cap_drop entries must be capability names, got {invalid}")
         return caps
 
     @field_validator("annotations")

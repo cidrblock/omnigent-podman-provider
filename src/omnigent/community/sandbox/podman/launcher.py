@@ -452,11 +452,17 @@ class PodmanSandboxLauncher(ExecModelHostLauncher):
             raise self._failed("Podman is unavailable; check the local user or Podman machine", info)
         if self.config.require_rootless and info.stdout.strip().lower() != "true":
             raise click.ClickException("Podman is not running rootless; use a rootless user or Podman machine")
-        if self.config.systemd_scope and shutil.which("systemd-run") is None:
-            raise click.ClickException(
-                "systemd_scope requires the systemd-run CLI; install systemd or set "
-                "systemd_scope: false"
-            )
+        if self.config.systemd_scope:
+            if shutil.which("systemd-run") is None:
+                raise click.ClickException(
+                    "systemd_scope requires the systemd-run CLI; install systemd or set "
+                    "systemd_scope: false"
+                )
+            if not os.environ.get("XDG_RUNTIME_DIR"):
+                raise click.ClickException(
+                    "systemd_scope requires XDG_RUNTIME_DIR so systemd-run can reach the "
+                    "user manager; set systemd_scope: false when running without one"
+                )
         image = self._podman("image", "exists", self.config.image)
         if image.returncode:
             raise self._failed(f"Podman image is unavailable: {self.config.image}", image)
